@@ -1,0 +1,4 @@
+# Keep LF everywhere so rustfmt/tooling behaves identically across platforms.
+* text=auto eol=lf
+# Fuzz corpus seeds are raw binary.
+fuzz/corpus/** -text
