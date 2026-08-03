@@ -9,6 +9,7 @@ pub mod config;
 pub mod error;
 pub mod io;
 pub mod keys;
+pub mod root;
 
 pub use error::CascError;
 pub use keys::{ContentKey, EncodingKey, TruncatedKey};
