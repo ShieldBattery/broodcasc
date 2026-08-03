@@ -254,7 +254,7 @@ fileOffset   = V & ((1 << SegmentBits)-1)  // 30 bits  -> byte offset, < 0x40000
 ```
 
 Verified: first entry of bucket 0 has `StorageOffset = 0x018BEA867F` → archive 6, offset
-0x0BE7A87F (199 689 855) — inside `data.006` (759 759 118 bytes). Also verified that
+0x0BEA867F (199 919 231) — inside `data.006` (759 759 118 bytes). Also verified that
 `data.004` is 1 073 741 823 bytes == `2^30 - 1`, exactly the 30-bit offset ceiling.
 
 ### 2.4 Bucket selection
