@@ -1,5 +1,8 @@
 [workspace]
 members = ["cli"]
+# Root-level `cargo run` resolves to the workspace's only bin (the CLI),
+# while `cargo test`/`build` still cover both crates.
+default-members = [".", "cli"]
 
 [package]
 name = "broodcasc"
