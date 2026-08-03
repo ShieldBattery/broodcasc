@@ -17,7 +17,7 @@ anything that wants to read files out of an SC:R install.
 ## Non-goals
 
 - Writing/repairing archives
-- Online (CDN) fetching or patching
+- Patching/updating installs
 - Products other than StarCraft: Remastered (other CASC games may work by
   accident, but only SC:R's format variant is tested or supported)
 
@@ -67,6 +67,33 @@ provides the ureq-based `HttpTransport` for native use, while WASM builds
 `fetch`/XHR. `CachingTransport` (with the `fs` feature) persists
 content-addressed downloads to disk, making reopening cheap. Reads are
 verified the same way as local storage (BLTE chunk MD5s + whole-file CKey).
+
+## CLI
+
+`cli/` is a small command-line front end over the library, installable with:
+
+```
+cargo install --path cli
+```
+
+```
+# Extract every tileset-ish file from a local install into ./out
+broodcasc --local extract "*tileset*" -o out
+
+# Extract a file straight from Blizzard's CDN, no install required
+broodcasc --cdn extract "SD/campaign/Starcraft/SWAR/staredit/scenario.chk" -o out
+
+# Print one file's decoded bytes to stdout
+broodcasc --local cat "SD/campaign/Starcraft/SWAR/staredit/scenario.chk"
+
+# List catalog paths matching a substring or glob
+broodcasc --local list scenario --sizes
+```
+
+`--local` defaults to `C:\Program Files (x86)\StarCraft` when given without a
+directory; with neither `--local` nor `--cdn`, it behaves as `--local`. See
+`broodcasc --help` for the full option list (region/product selection,
+pinning a specific CDN build, `--flat` extraction, ...).
 
 ## Fuzzing
 

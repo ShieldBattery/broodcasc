@@ -18,6 +18,10 @@ external docs; if reality disagrees with it, update it.
   `BROODCASC_TEST_STORAGE`)
 - `cargo clippy --all-targets --all-features -- -D warnings` and
   `cargo fmt --check` — both must stay clean
+- `cli/` is a `broodcasc` CLI binary (workspace member `broodcasc-cli`) over
+  the library; use `cargo test --workspace` and
+  `cargo clippy --workspace --all-targets --all-features -- -D warnings` to
+  cover it too
 - `cargo build --target wasm32-unknown-unknown --no-default-features` — must
   keep building; CI checks it
 - `cargo +nightly fuzz run <target> fuzz/seeds/<target>` (from repo root;
