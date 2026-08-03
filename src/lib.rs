@@ -4,6 +4,8 @@
 //! See the README for goals and usage; `docs/casc-format.md` documents the
 //! on-disk format this implementation follows.
 
+pub mod blte;
+pub mod config;
 pub mod error;
 pub mod io;
 pub mod keys;
