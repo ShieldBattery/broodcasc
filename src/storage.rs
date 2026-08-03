@@ -106,7 +106,10 @@ impl<P: StorageProvider> SpanReader<P> {
         if let Some(handle) = archives.get(&archive) {
             return Ok(Arc::clone(handle));
         }
-        let handle = Arc::new(self.provider.open(&format!("Data/data/data.{archive:03}"))?);
+        let handle = Arc::new(
+            self.provider
+                .open(&format!("Data/data/data.{archive:03}"))?,
+        );
         archives.insert(archive, Arc::clone(&handle));
         Ok(handle)
     }
