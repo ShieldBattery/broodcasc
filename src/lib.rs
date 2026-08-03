@@ -5,5 +5,8 @@
 //! on-disk format this implementation follows.
 
 pub mod error;
+pub mod io;
+pub mod keys;
 
 pub use error::CascError;
+pub use keys::{ContentKey, EncodingKey, TruncatedKey};

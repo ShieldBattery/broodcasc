@@ -1,11 +1,11 @@
 [package]
 name = "broodcasc"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 license = "MIT OR Apache-2.0"
-rust-version = "1.75"
+rust-version = "1.85"
 description = "Pure-Rust reader for CASC archives as used by StarCraft: Remastered"
-repository = "https://github.com/tec27/broodcasc"
+repository = "https://github.com/ShieldBattery/broodcasc"
 keywords = ["casc", "starcraft", "blizzard", "archive"]
 categories = ["parser-implementations", "game-development"]
 
@@ -15,8 +15,8 @@ default = ["fs"]
 fs = []
 
 [dependencies]
-md-5 = "0.10"
-miniz_oxide = "0.8"
+md-5 = "0.11"
+miniz_oxide = "0.9"
 thiserror = "2.0"
 
 [dev-dependencies]
