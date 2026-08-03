@@ -35,3 +35,7 @@ ureq = { version = "3.3", optional = true }
 [dev-dependencies]
 assert_ok = "1.0"
 proptest = "1.11"
+
+[[example]]
+name = "extract_fuzz_corpus"
+required-features = ["fs"]

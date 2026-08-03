@@ -1,7 +1,7 @@
 //! Encoding-table parser.
 //!
 //! The "encoding" file maps content keys (CKey, MD5 of a file's decoded
-//! contents) to encoding keys (EKey, MD5 of the file's BLTE-encoded
+//! contents) to encoding keys (EKey, an opaque address for an encoded
 //! representation) plus the decoded file size. It is itself delivered as a
 //! BLTE-encoded file; this module parses the already-decoded bytes.
 //!

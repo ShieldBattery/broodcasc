@@ -5,14 +5,18 @@
 //! listing the builds installed for a product; each row's `Build Key` is the
 //! CKey of a build config file living under `config/`. That build config is
 //! itself a simple `key = value` text file whose values are (mostly)
-//! whitespace-separated pairs of `CKey EKey` hashes pointing at the encoding
-//! file, install manifest, root file, and so on.
+//! whitespace-separated `CKey EKey` pairs pointing at the encoding file,
+//! install manifest, root file, and so on.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::error::{CascError, Result};
 use crate::keys::{ContentKey, EncodingKey};
+
+const MAX_BUILD_INFO_COLUMNS: usize = 1_024;
+const MAX_BUILD_INFO_RECORDS: usize = 100_000;
+const MAX_BUILD_INFO_FIELDS: usize = 1_000_000;
 
 /// A parsed `.build.info` file: a pipe-delimited table of installed builds.
 ///
@@ -25,8 +29,14 @@ pub struct BuildInfo {
 /// One row of a [`BuildInfo`] table, addressable by column name.
 #[derive(Debug, Clone)]
 pub struct BuildInfoRecord {
-    columns: Arc<[String]>,
+    columns: Arc<BuildInfoColumns>,
     values: Vec<Option<String>>,
+}
+
+#[derive(Debug)]
+struct BuildInfoColumns {
+    count: usize,
+    index: HashMap<String, usize>,
 }
 
 impl BuildInfo {
@@ -60,7 +70,20 @@ impl BuildInfo {
             .next()
             .ok_or_else(|| CascError::malformed("build info", "empty input"))?;
 
+        let header_column_count = header.split('|').count();
+        if header_column_count > MAX_BUILD_INFO_COLUMNS {
+            return Err(CascError::LimitExceeded {
+                what: "build info columns",
+                limit: MAX_BUILD_INFO_COLUMNS,
+            });
+        }
         let mut columns = Vec::new();
+        columns
+            .try_reserve_exact(header_column_count)
+            .map_err(|_| CascError::LimitExceeded {
+                what: "build info columns",
+                limit: MAX_BUILD_INFO_COLUMNS,
+            })?;
         for col in header.split('|') {
             if !col.contains('!') {
                 return Err(CascError::malformed(
@@ -71,30 +94,71 @@ impl BuildInfo {
             let name = col.split('!').next().unwrap_or(col).trim();
             columns.push(name.to_string());
         }
-        let columns: Arc<[String]> = columns.into();
+        let column_count = columns.len();
+        let mut column_index = HashMap::new();
+        column_index
+            .try_reserve(column_count)
+            .map_err(|_| CascError::LimitExceeded {
+                what: "build info columns",
+                limit: text.len(),
+            })?;
+        for (position, name) in columns.into_iter().enumerate() {
+            // Preserve the old behavior for duplicate column names: `get`
+            // returned the first matching column.
+            column_index.entry(name).or_insert(position);
+        }
+        let columns = Arc::new(BuildInfoColumns {
+            count: column_count,
+            index: column_index,
+        });
 
         let mut records = Vec::new();
+        let mut total_fields = 0usize;
         for line in lines {
-            let fields: Vec<&str> = line.split('|').collect();
-            if fields.len() > columns.len() {
+            if records.len() >= MAX_BUILD_INFO_RECORDS {
+                return Err(CascError::LimitExceeded {
+                    what: "build info records",
+                    limit: MAX_BUILD_INFO_RECORDS,
+                });
+            }
+            let field_count = line.split('|').count();
+            if field_count > columns.count {
                 return Err(CascError::malformed(
                     "build info",
                     format!(
                         "record has {} fields but header has {}",
-                        fields.len(),
-                        columns.len()
+                        field_count, columns.count
                     ),
                 ));
             }
-            let values = (0..columns.len())
-                .map(|i| {
-                    fields
-                        .get(i)
-                        .copied()
-                        .filter(|v| !v.is_empty())
-                        .map(str::to_string)
-                })
-                .collect();
+            total_fields =
+                total_fields
+                    .checked_add(field_count)
+                    .ok_or(CascError::LimitExceeded {
+                        what: "build info fields",
+                        limit: MAX_BUILD_INFO_FIELDS,
+                    })?;
+            if total_fields > MAX_BUILD_INFO_FIELDS {
+                return Err(CascError::LimitExceeded {
+                    what: "build info fields",
+                    limit: MAX_BUILD_INFO_FIELDS,
+                });
+            }
+            // Missing trailing fields are represented by the vector ending,
+            // rather than allocating one `None` per missing column. This is
+            // important for hostile tables with a wide header and many short
+            // records: retained memory remains proportional to the input.
+            let mut values = Vec::new();
+            values
+                .try_reserve_exact(field_count)
+                .map_err(|_| CascError::LimitExceeded {
+                    what: "build info fields",
+                    limit: MAX_BUILD_INFO_FIELDS,
+                })?;
+            values.extend(
+                line.split('|')
+                    .map(|value| (!value.is_empty()).then(|| value.to_string())),
+            );
             records.push(BuildInfoRecord {
                 columns: columns.clone(),
                 values,
@@ -123,7 +187,7 @@ impl BuildInfoRecord {
     /// the record didn't have enough fields to reach it, or the value was
     /// empty.
     pub fn get(&self, column: &str) -> Option<&str> {
-        let index = self.columns.iter().position(|c| c == column)?;
+        let index = *self.columns.index.get(column)?;
         self.values.get(index)?.as_deref()
     }
 
@@ -170,8 +234,8 @@ impl BuildConfig {
     /// comment (only recognized at the start of a line, after trimming
     /// whitespace). Many values are whitespace-separated pairs of hashes:
     /// the first is a [`ContentKey`] (CKey, the MD5 of the decoded file) and
-    /// the second, where present, is the [`EncodingKey`] (EKey, the MD5 of
-    /// the BLTE-encoded file, directly usable to locate it in local
+    /// the second, where present, is the [`EncodingKey`] (EKey, an opaque
+    /// address directly usable to locate an encoded representation in local
     /// indices). `root` is the odd one out and has only a CKey, since the
     /// root file must be looked up through the encoding table like any
     /// other content.
@@ -363,6 +427,57 @@ build-playbuild-installer = ngdptool_casc2
         assert_eq!(record.get("Active"), Some("1"));
         assert_eq!(record.get("Build Key"), None);
         assert!(record.build_key().is_err());
+    }
+
+    #[test]
+    fn build_info_wide_header_short_records_store_only_supplied_fields() {
+        const COLUMN_COUNT: usize = 512;
+        const RECORD_COUNT: usize = 512;
+
+        let header = (0..COLUMN_COUNT)
+            .map(|i| format!("Column{i}!STRING:0"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let mut text = header;
+        text.push('\n');
+        for i in 0..RECORD_COUNT {
+            text.push_str(&i.to_string());
+            text.push('\n');
+        }
+
+        let info = assert_ok!(BuildInfo::parse(&text));
+        assert_eq!(info.records().len(), RECORD_COUNT);
+        assert!(info.records().iter().all(|record| record.values.len() == 1));
+        assert_eq!(info.records()[123].get("Column0"), Some("123"));
+        assert_eq!(info.records()[123].get("Column511"), None);
+    }
+
+    #[test]
+    fn build_info_rejects_structurally_amplifying_headers() {
+        let header = (0..=MAX_BUILD_INFO_COLUMNS)
+            .map(|i| format!("Column{i}!STRING:0"))
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(matches!(
+            BuildInfo::parse(&header),
+            Err(CascError::LimitExceeded {
+                what: "build info columns",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn build_info_column_index_is_shared_and_preserves_first_duplicate() {
+        let text = "Name!STRING:0|Name!STRING:0|Active!DEC:1\nfirst|second|0\nnext|ignored|1\n";
+        let info = assert_ok!(BuildInfo::parse(text));
+
+        assert!(Arc::ptr_eq(
+            &info.records()[0].columns,
+            &info.records()[1].columns
+        ));
+        assert_eq!(info.records()[0].get("Name"), Some("first"));
+        assert_eq!(info.active_record().unwrap().get("Name"), Some("next"));
     }
 
     #[test]

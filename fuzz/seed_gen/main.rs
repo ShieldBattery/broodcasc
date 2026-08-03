@@ -33,7 +33,18 @@ fn main() {
 
     println!("verifying seeds parse with the real parsers...");
     for (name, bytes) in &blte {
-        expect_ok(name, broodcasc::blte::decode(bytes).map(|_| ()));
+        let result = broodcasc::blte::decode(bytes).map(|_| ());
+        if *name == "nested_f_parent_size_mismatch.blte" {
+            match result {
+                Err(broodcasc::CascError::Malformed {
+                    what: "BLTE chunk",
+                    reason,
+                }) if reason.contains("mode 'F'") => {}
+                other => panic!("seed {name} produced unexpected result: {other:?}"),
+            }
+        } else {
+            expect_ok(name, result);
+        }
     }
     for (name, bytes) in &encoding {
         expect_ok(
@@ -119,7 +130,8 @@ fn build_single_chunk(mode: u8, payload: &[u8]) -> Vec<u8> {
 
 /// Builds a BLTE buffer with a chunk table from `(mode, payload,
 /// decompressed_size)` triples, where `payload` is the pre-mode-byte data
-/// (raw bytes for `N`, already zlib-compressed bytes for `Z`).
+/// (raw bytes for `N`, already zlib-compressed bytes for `Z`, or a complete
+/// nested BLTE stream for `F`).
 fn build_multi_chunk(chunks: &[(u8, &[u8], u32)]) -> Vec<u8> {
     let chunk_count = chunks.len() as u32;
     let header_size = 8 + 4 + CHUNK_ENTRY_SIZE * chunks.len();
@@ -193,6 +205,22 @@ fn blte_seeds() -> Vec<(&'static str, Vec<u8>)> {
     // Empty single-chunk payload (mirrors the real "empty file" case noted in
     // docs/casc-format.md §4.1: header_size==0, mode byte, zero bytes of data).
     seeds.push(("empty_n.blte", build_single_chunk(b'N', b"")));
+
+    // Valid recursive frame: a table-form F chunk containing another complete
+    // table-form BLTE stream.
+    let nested_text = b"synthetic nested F-mode payload";
+    let inner = build_multi_chunk(&[(b'N', nested_text, nested_text.len() as u32)]);
+    seeds.push((
+        "nested_f.blte",
+        build_multi_chunk(&[(b'F', &inner, nested_text.len() as u32)]),
+    ));
+
+    // The outer F frame's declared decoded size disagrees with its valid
+    // nested stream. This intentionally-valid-shaped seed must be rejected.
+    seeds.push((
+        "nested_f_parent_size_mismatch.blte",
+        build_multi_chunk(&[(b'F', &inner, nested_text.len() as u32 + 1)]),
+    ));
 
     seeds
 }
@@ -326,19 +354,105 @@ fn encoding_seeds() -> Vec<(&'static str, Vec<u8>)> {
 // Local index (.idx v7)
 
 const HEADER_BLOCK_SIZE: u32 = 0x10;
+const IDX_HEADER_OFFSET: usize = 0x08;
+const IDX_HEADER_LEN: usize = 16;
+const IDX_ENTRIES_GUARD_OFFSET: usize = 0x20;
+const IDX_ENTRIES_OFFSET: usize = 0x28;
+const IDX_ENTRY_LEN: usize = 18;
+
+fn hashlittle(data: &[u8], initval: u32) -> u32 {
+    hashlittle2(data, initval, 0).0
+}
+
+fn hashlittle2(mut data: &[u8], pc: u32, pb: u32) -> (u32, u32) {
+    let seed = 0xDEAD_BEEFu32
+        .wrapping_add(data.len() as u32)
+        .wrapping_add(pc);
+    let mut a = seed;
+    let mut b = seed;
+    let mut c = seed.wrapping_add(pb);
+
+    while data.len() > 12 {
+        a = a.wrapping_add(u32::from_le_bytes(data[0..4].try_into().unwrap()));
+        b = b.wrapping_add(u32::from_le_bytes(data[4..8].try_into().unwrap()));
+        c = c.wrapping_add(u32::from_le_bytes(data[8..12].try_into().unwrap()));
+        jenkins_mix(&mut a, &mut b, &mut c);
+        data = &data[12..];
+    }
+
+    if data.is_empty() {
+        return (c, b);
+    }
+    for (index, &byte) in data.iter().enumerate() {
+        let value = u32::from(byte) << ((index % 4) * 8);
+        match index / 4 {
+            0 => a = a.wrapping_add(value),
+            1 => b = b.wrapping_add(value),
+            2 => c = c.wrapping_add(value),
+            _ => unreachable!("hashlittle tail is at most 12 bytes"),
+        }
+    }
+    jenkins_final(&mut a, &mut b, &mut c);
+    (c, b)
+}
+
+fn jenkins_mix(a: &mut u32, b: &mut u32, c: &mut u32) {
+    *a = (*a).wrapping_sub(*c);
+    *a ^= (*c).rotate_left(4);
+    *c = (*c).wrapping_add(*b);
+    *b = (*b).wrapping_sub(*a);
+    *b ^= (*a).rotate_left(6);
+    *a = (*a).wrapping_add(*c);
+    *c = (*c).wrapping_sub(*b);
+    *c ^= (*b).rotate_left(8);
+    *b = (*b).wrapping_add(*a);
+    *a = (*a).wrapping_sub(*c);
+    *a ^= (*c).rotate_left(16);
+    *c = (*c).wrapping_add(*b);
+    *b = (*b).wrapping_sub(*a);
+    *b ^= (*a).rotate_left(19);
+    *a = (*a).wrapping_add(*c);
+    *c = (*c).wrapping_sub(*b);
+    *c ^= (*b).rotate_left(4);
+    *b = (*b).wrapping_add(*a);
+}
+
+fn jenkins_final(a: &mut u32, b: &mut u32, c: &mut u32) {
+    *c ^= *b;
+    *c = (*c).wrapping_sub((*b).rotate_left(14));
+    *a ^= *c;
+    *a = (*a).wrapping_sub((*c).rotate_left(11));
+    *b ^= *a;
+    *b = (*b).wrapping_sub((*a).rotate_left(25));
+    *c ^= *b;
+    *c = (*c).wrapping_sub((*b).rotate_left(16));
+    *a ^= *c;
+    *a = (*a).wrapping_sub((*c).rotate_left(4));
+    *b ^= *a;
+    *b = (*b).wrapping_sub((*a).rotate_left(14));
+    *c ^= *b;
+    *c = (*c).wrapping_sub((*b).rotate_left(24));
+}
+
+fn idx_entry_block_hash(entries: &[u8]) -> u32 {
+    let mut hi = 0;
+    let mut lo = 0;
+    for entry in entries.chunks_exact(IDX_ENTRY_LEN) {
+        (hi, lo) = hashlittle2(entry, hi, lo);
+    }
+    hi
+}
 
 /// Builds a valid `.idx` v7 file from raw entry tuples: `(key9,
-/// storage_offset as 5 raw big-endian bytes, encoded_size)`. Guarded-block
-/// hashes are left as filler since the reader doesn't verify them (see
-/// docs/casc-format.md §2.2).
+/// storage_offset as 5 raw big-endian bytes, encoded_size)`, including the
+/// authoritative guarded-block hashes from docs/casc-format.md §2.2.
 fn build_idx_file(segment_bits: u8, entries: &[([u8; 9], [u8; 5], u32)]) -> Vec<u8> {
-    const ENTRY_LEN: usize = 18;
-    let entry_block_size = (entries.len() * ENTRY_LEN) as u32;
+    let entry_block_size = (entries.len() * IDX_ENTRY_LEN) as u32;
 
     let mut out = Vec::new();
     // File header guarded block.
     out.extend_from_slice(&HEADER_BLOCK_SIZE.to_le_bytes());
-    out.extend_from_slice(&0x1EEDF00Du32.to_le_bytes()); // BlockHash, unverified filler
+    out.extend_from_slice(&0u32.to_le_bytes()); // BlockHash, filled below
 
     // File header (16 bytes).
     out.extend_from_slice(&7u16.to_le_bytes()); // Revision
@@ -349,18 +463,29 @@ fn build_idx_file(segment_bits: u8, entries: &[([u8; 9], [u8; 5], u32)]) -> Vec<
     out.push(9); // KeyBytes
     out.push(segment_bits); // SegmentBits
     out.extend_from_slice(&0x0000_00FF_C000_0000u64.to_le_bytes()); // MaxFileOffset
+    let header_hash = hashlittle(
+        &out[IDX_HEADER_OFFSET..IDX_HEADER_OFFSET + IDX_HEADER_LEN],
+        0,
+    );
+    if segment_bits == 30 {
+        assert_eq!(header_hash, 0x1bc0_046b, "documented idx header vector");
+    }
+    out[4..8].copy_from_slice(&header_hash.to_le_bytes());
 
     out.extend_from_slice(&[0u8; 8]); // padding to 0x10 alignment
 
     // Entries guarded block header.
     out.extend_from_slice(&entry_block_size.to_le_bytes());
-    out.extend_from_slice(&0xCAFEF00Du32.to_le_bytes()); // BlockHash, unverified filler
+    out.extend_from_slice(&0u32.to_le_bytes()); // BlockHash, filled below
 
     for (key9, storage_offset, encoded_size) in entries {
         out.extend_from_slice(key9);
         out.extend_from_slice(storage_offset);
         out.extend_from_slice(&encoded_size.to_le_bytes());
     }
+    let entries_hash = idx_entry_block_hash(&out[IDX_ENTRIES_OFFSET..]);
+    out[IDX_ENTRIES_GUARD_OFFSET + 4..IDX_ENTRIES_OFFSET]
+        .copy_from_slice(&entries_hash.to_le_bytes());
 
     out
 }

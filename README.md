@@ -36,15 +36,35 @@ for name in storage.file_names() {
 }
 ```
 
-Every read is verified end to end (BLTE chunk MD5s plus the whole-file
-content MD5). Note that a partial install catalogs files it never
-downloaded (e.g. other locales' audio) — those reads fail with
-`CascError::NotInstalled`, distinct from `NotFound`.
+CKey-addressed reads verify BLTE chunk MD5s, the expected decoded size, and
+the whole-file CKey. A direct `read_by_ekey(..., None)` has no whole-object
+identity to verify; it still validates the local span/index framing and BLTE
+chunk checks. A partial install catalogs files it never downloaded (e.g. other
+locales' audio) — those reads fail with `CascError::NotInstalled`, distinct
+from `NotFound`.
 
 On WASM (or anything without `std::fs`), build with
 `--no-default-features` and hand `Storage::open_with_provider` your own
 `StorageProvider` implementation — e.g. OPFS sync access handles in a
 worker, or in-memory buffers.
+
+## Resource limits
+
+`ReadLimits` bounds encoded input, decoded output, chunks, nesting, and
+initial reservations. `StorageOptions` additionally bounds local and CDN
+bootstrap metadata, including decoded encoding/root objects (64 MiB per object
+by default). Structural caps also limit archive lists, hosts, and index-table
+growth. The defaults are conservative for SC:R; applications with a different
+asset policy can opt in explicitly:
+
+```rust,ignore
+use broodcasc::{ReadLimits, Storage, StorageOptions};
+
+let options = StorageOptions::default()
+    .with_read_limits(ReadLimits { max_decoded_bytes: 1024 * 1024 * 1024, ..ReadLimits::default() })
+    .with_max_metadata_bytes(16 * 1024 * 1024);
+let storage = Storage::open_with_options(r"C:\Program Files (x86)\StarCraft", options)?;
+```
 
 ## CDN ("online") storage
 
@@ -59,14 +79,22 @@ let storage = CdnStorage::open("s1", "us", transport)?;
 let bytes = storage.read_file("SD/campaign/Starcraft/SWAR/staredit/scenario.chk")?;
 ```
 
-`CdnStorage::open` discovers the current live build; `open_pinned` takes
-explicit build/CDN config hashes to pin a specific build instead. All
+`CdnStorage::open` discovers the current live build over unauthenticated plain
+HTTP. Use `open_pinned` with build/CDN config CKeys obtained through a trusted
+out-of-band channel whenever the selected build must be a trust anchor. All
 fetching goes through the `CdnTransport` trait: the `cdn-http` feature
 provides the ureq-based `HttpTransport` for native use, while WASM builds
 (`--no-default-features --features cdn`) supply their own transport over
 `fetch`/XHR. `CachingTransport` (with the `fs` feature) persists
-content-addressed downloads to disk, making reopening cheap. Reads are
-verified the same way as local storage (BLTE chunk MD5s + whole-file CKey).
+content-addressed downloads to disk, making reopening cheap.
+The cache has per-entry safety bounds and repairs rejected entries, but it does
+not impose a total disk quota; applications should manage the cache directory's
+lifetime or quota according to their platform.
+
+The checksums detect corruption and mismatched content but are not active
+authentication: MD5 is not a substitute for a signed manifest or authenticated
+transport. CKey-addressed CDN reads verify decoded content as above;
+`read_by_ekey(..., None)` does not establish a whole-object identity.
 
 ## CLI
 

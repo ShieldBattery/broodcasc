@@ -1,23 +1,19 @@
 #![no_main]
 
-use broodcasc::blte::{self, BlteHeader};
+use broodcasc::blte::{self, ReadLimits};
 use libfuzzer_sys::fuzz_target;
 
-/// Skip decoding inputs whose chunk table already declares an enormous total
-/// decompressed size, so a malicious/degenerate chunk table can't turn a tiny
-/// input into a multi-minute inflate (a "decompression bomb"). Inputs with no
-/// chunk table (`header_size == 0`, unknown decompressed size) are still
-/// decoded — `decode` internally caps that case at 1 GiB, and libFuzzer's
-/// `-max_len` bounds the input size from the runner side.
-const MAX_DECOMPRESSED: u64 = 64 * 1024 * 1024; // 64 MiB
+/// Small, explicit bounds keep fuzz iterations cheap while still sending
+/// oversized declarations through the production limit-rejection paths.
+const FUZZ_LIMITS: ReadLimits = ReadLimits {
+    max_encoded_bytes: 1024 * 1024,
+    max_decoded_bytes: 256 * 1024,
+    max_chunk_decoded_bytes: 64 * 1024,
+    max_chunk_count: 128,
+    max_nesting: 4,
+    initial_reserve_bytes: 16 * 1024,
+};
 
 fuzz_target!(|data: &[u8]| {
-    let too_big = BlteHeader::parse(data)
-        .ok()
-        .and_then(|header| header.total_decompressed_size())
-        .is_some_and(|total| total > MAX_DECOMPRESSED);
-    if too_big {
-        return;
-    }
-    let _ = blte::decode(data);
+    let _ = blte::decode_with_limits(data, FUZZ_LIMITS);
 });

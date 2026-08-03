@@ -7,15 +7,28 @@ rust-version = "1.95"
 description = "Command-line tool for reading files out of StarCraft: Remastered CASC storage"
 publish = false
 
+[features]
+default = ["native"]
+# The CLI is a native application. Keeping its complete dependency set behind
+# one feature lets workspace-wide `--no-default-features` WASM builds skip the
+# binary without pulling the native HTTP transport into the core library.
+native = ["dep:anyhow", "dep:broodcasc", "dep:clap", "dep:globset"]
+
 [[bin]]
 name = "broodcasc"
 path = "src/main.rs"
+required-features = ["native"]
+
+[[test]]
+name = "local_cli"
+path = "tests/local_cli.rs"
+required-features = ["native"]
 
 [dependencies]
-broodcasc = { path = "..", features = ["cdn-http"] }
-anyhow = "1.0.104"
-clap = { version = "4.6.5", features = ["derive"] }
-globset = "0.4.19"
+broodcasc = { path = "..", features = ["cdn-http"], optional = true }
+anyhow = { version = "1.0.104", optional = true }
+clap = { version = "4.6.5", features = ["derive"], optional = true }
+globset = { version = "0.4.19", optional = true }
 
 [dev-dependencies]
 assert_cmd = "2.2.2"

@@ -24,6 +24,9 @@ pub enum CascError {
     Transport { url: String, reason: String },
     #[error("checksum mismatch in {0}")]
     ChecksumMismatch(&'static str),
+    /// An untrusted object exceeded a caller-configured resource limit.
+    #[error("{what} exceeds configured limit ({limit})")]
+    LimitExceeded { what: &'static str, limit: usize },
 }
 
 impl CascError {

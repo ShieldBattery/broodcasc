@@ -44,11 +44,42 @@ use crate::error::{CascError, Result};
 const MAGIC: &[u8; 4] = b"BLTE";
 /// Size of one chunk table entry: compressed_size(4) + decompressed_size(4) + md5(16).
 const CHUNK_ENTRY_SIZE: usize = 24;
-/// Maximum recursion depth for nested (`F`-mode) BLTE chunks.
-const MAX_NEST_DEPTH: u32 = 4;
-/// Cap on decompressed size when it isn't known up front (header_size == 0,
-/// mode `Z`), to bound zlib-bomb style inputs.
-const UNKNOWN_SIZE_LIMIT: usize = 1 << 30; // 1 GiB
+
+/// Resource limits for a complete encoded CASC object.
+///
+/// These limits apply before allocating from attacker-controlled metadata and
+/// while expanding compressed data. [`Default`] is deliberately conservative
+/// for StarCraft: Remastered; callers that need different limits can use
+/// [`decode_with_limits`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadLimits {
+    /// Largest accepted encoded BLTE object.
+    pub max_encoded_bytes: usize,
+    /// Largest final decoded object, including nested `F` chunks.
+    pub max_decoded_bytes: usize,
+    /// Largest decoded output of a single BLTE chunk.
+    pub max_chunk_decoded_bytes: usize,
+    /// Largest number of entries in one BLTE chunk table.
+    pub max_chunk_count: usize,
+    /// Largest nesting depth of `F` chunks.
+    pub max_nesting: u32,
+    /// Largest up-front output reservation. Actual growth remains bounded by
+    /// `max_decoded_bytes`.
+    pub initial_reserve_bytes: usize,
+}
+
+impl Default for ReadLimits {
+    fn default() -> Self {
+        Self {
+            max_encoded_bytes: 256 * 1024 * 1024,
+            max_decoded_bytes: 512 * 1024 * 1024,
+            max_chunk_decoded_bytes: 64 * 1024 * 1024,
+            max_chunk_count: 16_384,
+            max_nesting: 4,
+            initial_reserve_bytes: 8 * 1024 * 1024,
+        }
+    }
+}
 
 /// Metadata for a single chunk from a BLTE chunk table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,93 +111,7 @@ impl BlteHeader {
     /// Only the header bytes are required to be present; chunk data itself
     /// is not validated here.
     pub fn parse(data: &[u8]) -> Result<BlteHeader> {
-        if data.len() < 8 {
-            return Err(CascError::malformed(
-                "BLTE header",
-                "input shorter than 8 bytes",
-            ));
-        }
-        if &data[0..4] != MAGIC {
-            return Err(CascError::malformed("BLTE header", "bad magic"));
-        }
-        let header_size = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
-
-        if header_size == 0 {
-            return Ok(BlteHeader {
-                chunks: Vec::new(),
-                data_start: 8,
-            });
-        }
-
-        if data.len() < header_size {
-            return Err(CascError::malformed(
-                "BLTE header",
-                "input shorter than declared header_size",
-            ));
-        }
-        if data.len() < 9 {
-            return Err(CascError::malformed(
-                "BLTE header",
-                "input too short for chunk table",
-            ));
-        }
-
-        let flags = data[8];
-        if flags != 0x0F {
-            return Err(CascError::malformed(
-                "BLTE header",
-                format!("unexpected chunk table flags 0x{flags:02x}"),
-            ));
-        }
-        if data.len() < 12 {
-            return Err(CascError::malformed(
-                "BLTE header",
-                "input too short for chunk count",
-            ));
-        }
-        let chunk_count = u32::from_be_bytes([0, data[9], data[10], data[11]]) as usize;
-        if chunk_count == 0 {
-            return Err(CascError::malformed("BLTE header", "chunk_count is zero"));
-        }
-
-        let expected_header_size = 8 + 4 + CHUNK_ENTRY_SIZE * chunk_count;
-        if header_size != expected_header_size {
-            return Err(CascError::malformed(
-                "BLTE header",
-                format!(
-                    "header_size {header_size} does not match chunk_count {chunk_count} \
-                     (expected {expected_header_size})"
-                ),
-            ));
-        }
-
-        let mut chunks = Vec::with_capacity(chunk_count);
-        let mut offset = header_size;
-        let mut entry_pos = 12;
-        for _ in 0..chunk_count {
-            let entry = &data[entry_pos..entry_pos + CHUNK_ENTRY_SIZE];
-            let compressed_size = u32::from_be_bytes(entry[0..4].try_into().unwrap());
-            let decompressed_size = u32::from_be_bytes(entry[4..8].try_into().unwrap());
-            let mut md5 = [0u8; 16];
-            md5.copy_from_slice(&entry[8..24]);
-
-            chunks.push(ChunkInfo {
-                compressed_size,
-                decompressed_size,
-                md5,
-                offset,
-            });
-
-            offset = offset
-                .checked_add(compressed_size as usize)
-                .ok_or_else(|| CascError::malformed("BLTE header", "chunk size overflow"))?;
-            entry_pos += CHUNK_ENTRY_SIZE;
-        }
-
-        Ok(BlteHeader {
-            chunks,
-            data_start: header_size,
-        })
+        parse_with_limits(data, ReadLimits::default())
     }
 
     /// Total decompressed size of all chunks combined, or `None` if the
@@ -176,7 +121,9 @@ impl BlteHeader {
         if self.chunks.is_empty() {
             return None;
         }
-        Some(self.chunks.iter().map(|c| c.decompressed_size as u64).sum())
+        self.chunks.iter().try_fold(0u64, |sum, chunk| {
+            sum.checked_add(chunk.decompressed_size as u64)
+        })
     }
 
     /// The chunk table entries, in order. Empty when `header_size == 0`.
@@ -191,6 +138,109 @@ impl BlteHeader {
     }
 }
 
+fn parse_with_limits(data: &[u8], limits: ReadLimits) -> Result<BlteHeader> {
+    if data.len() > limits.max_encoded_bytes {
+        return Err(limit("BLTE encoded input", limits.max_encoded_bytes));
+    }
+    if data.len() < 8 {
+        return Err(CascError::malformed(
+            "BLTE header",
+            "input shorter than 8 bytes",
+        ));
+    }
+    if &data[0..4] != MAGIC {
+        return Err(CascError::malformed("BLTE header", "bad magic"));
+    }
+    let header_size = u32::from_be_bytes(data[4..8].try_into().unwrap()) as usize;
+
+    if header_size == 0 {
+        return Ok(BlteHeader {
+            chunks: Vec::new(),
+            data_start: 8,
+        });
+    }
+
+    if data.len() < header_size {
+        return Err(CascError::malformed(
+            "BLTE header",
+            "input shorter than declared header_size",
+        ));
+    }
+    if data.len() < 12 {
+        return Err(CascError::malformed(
+            "BLTE header",
+            "input too short for chunk count",
+        ));
+    }
+    let flags = data[8];
+    if flags != 0x0F {
+        return Err(CascError::malformed(
+            "BLTE header",
+            format!("unexpected chunk table flags 0x{flags:02x}"),
+        ));
+    }
+    let chunk_count = u32::from_be_bytes([0, data[9], data[10], data[11]]) as usize;
+    if chunk_count == 0 {
+        return Err(CascError::malformed("BLTE header", "chunk_count is zero"));
+    }
+    if chunk_count > limits.max_chunk_count {
+        return Err(limit("BLTE chunk count", limits.max_chunk_count));
+    }
+
+    let expected_header_size = 12usize
+        .checked_add(
+            CHUNK_ENTRY_SIZE
+                .checked_mul(chunk_count)
+                .ok_or_else(|| CascError::malformed("BLTE header", "chunk count overflow"))?,
+        )
+        .ok_or_else(|| CascError::malformed("BLTE header", "header size overflow"))?;
+    if header_size != expected_header_size {
+        return Err(CascError::malformed(
+            "BLTE header",
+            format!(
+                "header_size {header_size} does not match chunk_count {chunk_count} \
+                     (expected {expected_header_size})"
+            ),
+        ));
+    }
+
+    let mut chunks = Vec::new();
+    chunks
+        .try_reserve_exact(chunk_count)
+        .map_err(|_| limit("BLTE chunk table allocation", limits.max_chunk_count))?;
+    let mut offset = header_size;
+    let mut entry_pos: usize = 12;
+    for _ in 0..chunk_count {
+        let entry_end = entry_pos
+            .checked_add(CHUNK_ENTRY_SIZE)
+            .ok_or_else(|| CascError::malformed("BLTE header", "chunk entry overflow"))?;
+        let entry = data
+            .get(entry_pos..entry_end)
+            .ok_or_else(|| CascError::malformed("BLTE header", "truncated chunk table"))?;
+        let compressed_size = u32::from_be_bytes(entry[0..4].try_into().unwrap());
+        let decompressed_size = u32::from_be_bytes(entry[4..8].try_into().unwrap());
+        let mut md5 = [0u8; 16];
+        md5.copy_from_slice(&entry[8..24]);
+
+        chunks.push(ChunkInfo {
+            compressed_size,
+            decompressed_size,
+            md5,
+            offset,
+        });
+
+        offset = offset
+            .checked_add(compressed_size as usize)
+            .ok_or_else(|| CascError::malformed("BLTE header", "chunk size overflow"))?;
+        entry_pos = entry_end;
+    }
+
+    Ok(BlteHeader {
+        chunks,
+        data_start: header_size,
+    })
+}
+
 /// Decodes a single chunk's encoded data (mode byte + payload).
 ///
 /// `expected_size`, when known (chunk-table case), is used both to bound the
@@ -201,14 +251,27 @@ pub fn decode_chunk(
     expected_size: Option<u32>,
     expected_md5: Option<&[u8; 16]>,
 ) -> Result<Vec<u8>> {
-    decode_chunk_inner(encoded, expected_size, expected_md5, 0)
+    let limits = ReadLimits::default();
+    if encoded.len() > limits.max_encoded_bytes {
+        return Err(limit("BLTE encoded input", limits.max_encoded_bytes));
+    }
+    decode_chunk_inner(
+        encoded,
+        expected_size.map(|size| size as usize),
+        expected_md5,
+        0,
+        limits,
+        limits.max_decoded_bytes,
+    )
 }
 
 fn decode_chunk_inner(
     encoded: &[u8],
-    expected_size: Option<u32>,
+    expected_size: Option<usize>,
     expected_md5: Option<&[u8; 16]>,
     depth: u32,
+    limits: ReadLimits,
+    remaining_output: usize,
 ) -> Result<Vec<u8>> {
     if let Some(expected) = expected_md5 {
         let actual: [u8; 16] = Md5::digest(encoded).into();
@@ -227,7 +290,7 @@ fn decode_chunk_inner(
     match mode {
         b'N' => {
             if let Some(expected) = expected_size
-                && payload.len() as u32 != expected
+                && payload.len() != expected
             {
                 return Err(CascError::malformed(
                     "BLTE chunk",
@@ -237,15 +300,21 @@ fn decode_chunk_inner(
                     ),
                 ));
             }
-            Ok(payload.to_vec())
+            check_chunk_output(payload.len(), limits, remaining_output)?;
+            copy_bytes(payload, "BLTE raw chunk", limits.max_chunk_decoded_bytes)
         }
         b'Z' => {
-            let limit = expected_size.map_or(UNKNOWN_SIZE_LIMIT, |s| s as usize);
-            let decoded = decompress_to_vec_zlib_with_limit(payload, limit).map_err(|e| {
-                CascError::malformed("BLTE chunk", format!("zlib inflate failed: {e:?}"))
-            })?;
+            if let Some(expected) = expected_size {
+                check_chunk_output(expected, limits, remaining_output)?;
+            }
+            let output_limit =
+                expected_size.unwrap_or(remaining_output.min(limits.max_chunk_decoded_bytes));
+            let decoded =
+                decompress_to_vec_zlib_with_limit(payload, output_limit).map_err(|e| {
+                    CascError::malformed("BLTE chunk", format!("zlib inflate failed: {e:?}"))
+                })?;
             if let Some(expected) = expected_size
-                && decoded.len() as u32 != expected
+                && decoded.len() != expected
             {
                 return Err(CascError::malformed(
                     "BLTE chunk",
@@ -255,16 +324,38 @@ fn decode_chunk_inner(
                     ),
                 ));
             }
+            check_chunk_output(decoded.len(), limits, remaining_output)?;
             Ok(decoded)
         }
         b'F' => {
-            if depth >= MAX_NEST_DEPTH {
+            if depth >= limits.max_nesting {
                 return Err(CascError::malformed(
                     "BLTE chunk",
-                    format!("nested BLTE recursion exceeds max depth {MAX_NEST_DEPTH}"),
+                    format!(
+                        "nested BLTE recursion exceeds max depth {}",
+                        limits.max_nesting
+                    ),
                 ));
             }
-            decode_inner(payload, depth + 1)
+            if let Some(expected) = expected_size {
+                check_chunk_output(expected, limits, remaining_output)?;
+            }
+            let nested_limit =
+                expected_size.unwrap_or(remaining_output.min(limits.max_chunk_decoded_bytes));
+            let decoded = decode_inner(payload, depth + 1, limits, nested_limit)?;
+            if let Some(expected) = expected_size
+                && decoded.len() != expected
+            {
+                return Err(CascError::malformed(
+                    "BLTE chunk",
+                    format!(
+                        "mode 'F' decoded length {} does not match declared decompressed_size {expected}",
+                        decoded.len()
+                    ),
+                ));
+            }
+            check_chunk_output(decoded.len(), limits, remaining_output)?;
+            Ok(decoded)
         }
         b'E' => Err(CascError::Unsupported {
             what: "BLTE chunk",
@@ -279,25 +370,66 @@ fn decode_chunk_inner(
 
 /// Decodes a complete BLTE-encoded buffer into its decoded contents.
 pub fn decode(data: &[u8]) -> Result<Vec<u8>> {
-    decode_inner(data, 0)
+    decode_with_limits(data, ReadLimits::default())
 }
 
-fn decode_inner(data: &[u8], depth: u32) -> Result<Vec<u8>> {
-    let header = BlteHeader::parse(data)?;
+/// Decodes a complete BLTE-encoded buffer under explicit resource limits.
+pub fn decode_with_limits(data: &[u8], limits: ReadLimits) -> Result<Vec<u8>> {
+    decode_inner(data, 0, limits, limits.max_decoded_bytes)
+}
+
+fn decode_inner(
+    data: &[u8],
+    depth: u32,
+    limits: ReadLimits,
+    output_limit: usize,
+) -> Result<Vec<u8>> {
+    if data.len() > limits.max_encoded_bytes {
+        return Err(limit("BLTE encoded input", limits.max_encoded_bytes));
+    }
+    let header = parse_with_limits(data, limits)?;
 
     if header.chunks.is_empty() {
         // header_size == 0: entire remainder is a single chunk of unknown size.
-        let encoded = &data[header.data_start..];
-        return decode_chunk_inner(encoded, None, None, depth);
+        let encoded = data
+            .get(header.data_start..)
+            .ok_or_else(|| CascError::malformed("BLTE header", "missing implicit chunk"))?;
+        return decode_chunk_inner(encoded, None, None, depth, limits, output_limit);
     }
 
-    // Cap the preallocation: total_decompressed_size comes from the (as yet
-    // unverified) header, so don't let a hostile one force a giant alloc.
-    let capacity = header
-        .total_decompressed_size()
-        .unwrap_or(0)
-        .min(UNKNOWN_SIZE_LIMIT as u64) as usize;
-    let mut out = Vec::with_capacity(capacity);
+    let declared_total = header.chunks.iter().try_fold(0usize, |sum, chunk| {
+        sum.checked_add(chunk.decompressed_size as usize)
+            .ok_or_else(|| CascError::malformed("BLTE header", "decoded size overflow"))
+    })?;
+    let encoded_end = header
+        .chunks
+        .last()
+        .and_then(|chunk| chunk.offset.checked_add(chunk.compressed_size as usize))
+        .ok_or_else(|| CascError::malformed("BLTE header", "chunk size overflow"))?;
+    if encoded_end != data.len() {
+        return Err(CascError::malformed(
+            "BLTE chunk data",
+            format!(
+                "declared chunks end at byte {encoded_end}, but input length is {}",
+                data.len()
+            ),
+        ));
+    }
+    if declared_total > output_limit {
+        return Err(limit("BLTE decoded output", output_limit));
+    }
+    if header
+        .chunks
+        .iter()
+        .any(|chunk| chunk.decompressed_size as usize > limits.max_chunk_decoded_bytes)
+    {
+        return Err(limit("BLTE decoded chunk", limits.max_chunk_decoded_bytes));
+    }
+
+    let mut out = Vec::new();
+    let initial = declared_total.min(limits.initial_reserve_bytes);
+    out.try_reserve_exact(initial)
+        .map_err(|_| limit("BLTE decoded output allocation", output_limit))?;
     for chunk in &header.chunks {
         let end = chunk
             .offset
@@ -308,13 +440,39 @@ fn decode_inner(data: &[u8], depth: u32) -> Result<Vec<u8>> {
             .ok_or_else(|| CascError::malformed("BLTE chunk", "chunk extends past end of input"))?;
         let decoded = decode_chunk_inner(
             encoded,
-            Some(chunk.decompressed_size),
+            Some(chunk.decompressed_size as usize),
             Some(&chunk.md5),
             depth,
+            limits,
+            output_limit - out.len(),
         )?;
+        out.try_reserve(decoded.len())
+            .map_err(|_| limit("BLTE decoded output allocation", output_limit))?;
         out.extend_from_slice(&decoded);
     }
     Ok(out)
+}
+
+fn check_chunk_output(size: usize, limits: ReadLimits, remaining_output: usize) -> Result<()> {
+    if size > limits.max_chunk_decoded_bytes {
+        return Err(limit("BLTE decoded chunk", limits.max_chunk_decoded_bytes));
+    }
+    if size > remaining_output {
+        return Err(limit("BLTE decoded output", remaining_output));
+    }
+    Ok(())
+}
+
+fn copy_bytes(bytes: &[u8], what: &'static str, allocation_limit: usize) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.try_reserve_exact(bytes.len())
+        .map_err(|_| limit(what, allocation_limit))?;
+    out.extend_from_slice(bytes);
+    Ok(out)
+}
+
+fn limit(what: &'static str, limit: usize) -> CascError {
+    CascError::LimitExceeded { what, limit }
 }
 
 #[cfg(test)]
@@ -499,7 +657,7 @@ mod tests {
         // Build a chain of nested BLTE buffers deeper than MAX_NEST_DEPTH.
         let leaf = b"leaf";
         let mut current = build_blte(&[(b'N', leaf, leaf.len() as u32)]);
-        for _ in 0..(MAX_NEST_DEPTH + 2) {
+        for _ in 0..(ReadLimits::default().max_nesting + 2) {
             current = build_blte(&[(b'F', &current, leaf.len() as u32)]);
         }
         let err = decode(&current).unwrap_err();
@@ -561,10 +719,117 @@ mod tests {
     }
 
     #[test]
+    fn short_nonzero_header_is_rejected_without_panicking() {
+        let mut input = Vec::new();
+        input.extend_from_slice(MAGIC);
+        input.extend_from_slice(&8u32.to_be_bytes());
+        assert!(BlteHeader::parse(&input).is_err());
+    }
+
+    #[test]
     fn bad_flags_byte_is_rejected() {
         let mut blte = build_blte(&[(b'N', b"hello", 5)]);
         blte[8] = 0x00;
         assert!(decode(&blte).is_err());
+    }
+
+    #[test]
+    fn huge_declared_chunk_count_is_rejected_before_table_allocation() {
+        let mut input = Vec::new();
+        input.extend_from_slice(MAGIC);
+        input.extend_from_slice(&12u32.to_be_bytes());
+        input.push(0x0F);
+        input.extend_from_slice(&16_385u32.to_be_bytes()[1..]);
+
+        let err = BlteHeader::parse(&input).unwrap_err();
+        assert!(matches!(
+            err,
+            CascError::LimitExceeded {
+                what: "BLTE chunk count",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn encoded_input_limit_is_checked_before_header_parsing() {
+        let blte = build_single_chunk(b'N', b"hello");
+        let limits = ReadLimits {
+            max_encoded_bytes: blte.len() - 1,
+            ..ReadLimits::default()
+        };
+        let err = decode_with_limits(&blte, limits).unwrap_err();
+        assert!(matches!(
+            err,
+            CascError::LimitExceeded {
+                what: "BLTE encoded input",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn per_chunk_decoded_limit_is_enforced_before_copying() {
+        let blte = build_blte(&[(b'N', b"12345", 5)]);
+        let limits = ReadLimits {
+            max_chunk_decoded_bytes: 4,
+            ..ReadLimits::default()
+        };
+        let err = decode_with_limits(&blte, limits).unwrap_err();
+        assert!(matches!(
+            err,
+            CascError::LimitExceeded {
+                what: "BLTE decoded chunk",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn aggregate_decoded_limit_is_enforced_before_decoding_chunks() {
+        let blte = build_blte(&[(b'N', b"1234", 4), (b'N', b"5678", 4)]);
+        let limits = ReadLimits {
+            max_decoded_bytes: 7,
+            max_chunk_decoded_bytes: 4,
+            ..ReadLimits::default()
+        };
+        let err = decode_with_limits(&blte, limits).unwrap_err();
+        assert!(matches!(
+            err,
+            CascError::LimitExceeded {
+                what: "BLTE decoded output",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn chunk_table_rejects_trailing_unchecked_bytes() {
+        let mut blte = build_blte(&[(b'N', b"payload", 7)]);
+        blte.extend_from_slice(b"trailing");
+
+        let err = decode(&blte).unwrap_err();
+        assert!(matches!(
+            err,
+            CascError::Malformed {
+                what: "BLTE chunk data",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn nested_frame_must_match_its_parent_declared_size() {
+        let inner = build_blte(&[(b'N', b"ok", 2)]);
+        let outer = build_blte(&[(b'F', &inner, 3)]);
+        let err = decode(&outer).unwrap_err();
+        assert!(matches!(
+            err,
+            CascError::Malformed {
+                what: "BLTE chunk",
+                ..
+            }
+        ));
     }
 
     proptest! {

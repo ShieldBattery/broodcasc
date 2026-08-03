@@ -15,6 +15,7 @@
 //! `docs/casc-format.md` §6.
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 
 use crate::error::{CascError, Result};
 use crate::keys::ContentKey;
@@ -46,7 +47,8 @@ impl RootFile {
     /// Lines that don't look like records (no `|`, or a hash that isn't 32
     /// hex chars) are skipped, matching CascLib's tolerance; a file yielding
     /// zero records is rejected as malformed since it almost certainly means
-    /// the input isn't a root file at all.
+    /// the input isn't a root file at all. Duplicate normalized paths are
+    /// rejected rather than silently making earlier records unreachable.
     pub fn parse(data: &[u8]) -> Result<RootFile> {
         let text = str::from_utf8(data)
             .map_err(|_| CascError::malformed("root file", "not valid UTF-8"))?;
@@ -66,7 +68,17 @@ impl RootFile {
 
             let id = u32::try_from(entries.len())
                 .map_err(|_| CascError::malformed("root file", "too many entries"))?;
-            index.insert(normalize_path(path), id);
+            match index.entry(normalize_path(path)) {
+                Entry::Vacant(slot) => {
+                    slot.insert(id);
+                }
+                Entry::Occupied(_) => {
+                    return Err(CascError::malformed(
+                        "root file",
+                        format!("duplicate normalized path: {path:?}"),
+                    ));
+                }
+            }
             entries.push(RootEntry {
                 path: path.to_string(),
                 ckey,
@@ -170,6 +182,14 @@ mod tests {
         let root = assert_ok!(RootFile::parse(text.as_bytes()));
         assert_eq!(root.len(), 1);
         assert!(root.lookup("some/file.wav").is_some());
+    }
+
+    #[test]
+    fn rejects_duplicate_normalized_paths() {
+        let text = "Some/Path/file.wav|316b0274bf2dabaa8db60c3ff1270c85\n\
+                    some\\path\\FILE.wav|6637ed776bd22089e083b8b0b2c0374c\n";
+        let err = RootFile::parse(text.as_bytes()).unwrap_err();
+        assert!(matches!(err, CascError::Malformed { .. }));
     }
 
     #[test]

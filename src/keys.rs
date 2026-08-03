@@ -1,10 +1,10 @@
 //! Key types used throughout CASC storage.
 //!
 //! A [`ContentKey`] (CKey) is the MD5 of a file's decoded contents; it's what
-//! the root file maps names to. An [`EncodingKey`] (EKey) is the MD5 of the
-//! encoded (BLTE) representation; it's what indices and archives are addressed
-//! by. The encoding file maps CKeys to EKeys. Local `.idx` indices store only
-//! the first 9 bytes of an EKey ([`TruncatedKey`]).
+//! the root file maps names to. An [`EncodingKey`] (EKey) is an opaque address
+//! for one encoded representation; indices and archives use it to locate that
+//! representation. The encoding file maps CKeys to EKeys. Local `.idx` indices
+//! store only the first 9 bytes of an EKey ([`TruncatedKey`]).
 
 use core::fmt;
 
@@ -78,7 +78,7 @@ key_type!(
     ContentKey, 16, "content key"
 );
 key_type!(
-    /// MD5 of a file's encoded (BLTE) representation ("EKey").
+    /// Opaque address of an encoded representation ("EKey").
     EncodingKey, 16, "encoding key"
 );
 key_type!(

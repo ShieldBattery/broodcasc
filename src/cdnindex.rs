@@ -131,16 +131,37 @@ impl ArchiveIndex {
         if page_size_kb == 0 {
             return Err(CascError::malformed(WHAT, "page size is zero"));
         }
-        let element_count = u32::from_le_bytes(footer[24..28].try_into().unwrap());
+        let element_count = u32::from_le_bytes(footer[24..28].try_into().unwrap()) as usize;
 
         let page_size = usize::from(page_size_kb) * 1024;
         // The footer is always present past this point, so entries may never
         // be read from here on.
         let limit = data.len() - FOOTER_LEN;
 
-        let mut entries = Vec::with_capacity(element_count as usize);
+        // Reject impossible counts before reserving. The bytes before the
+        // footer also contain page padding and the TOC, so this is a generous
+        // upper bound, but importantly it is derived from the input length
+        // rather than solely from an attacker-controlled footer field.
+        let max_entries = limit / ENTRY_LEN;
+        if element_count > max_entries {
+            return Err(CascError::malformed(
+                WHAT,
+                format!(
+                    "element count {element_count} exceeds the maximum {max_entries} entries \
+                     that fit before the footer"
+                ),
+            ));
+        }
+
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(element_count)
+            .map_err(|_| CascError::LimitExceeded {
+                what: "CDN archive index entries",
+                limit: data.len(),
+            })?;
         let mut cursor = 0usize;
-        while entries.len() < element_count as usize {
+        while entries.len() < element_count {
             let record_end = cursor.checked_add(ENTRY_LEN).ok_or_else(|| {
                 CascError::malformed(WHAT, "entry cursor overflowed while scanning pages")
             })?;
@@ -258,6 +279,26 @@ impl CdnIndex {
                 },
             );
         }
+    }
+
+    /// Fallible insertion path for untrusted CDN bootstrap data. The public
+    /// builder remains convenient for already-owned indices; storage open
+    /// uses this variant so allocation failure is reported rather than
+    /// panicking or aborting after a hostile aggregate declaration.
+    pub(crate) fn try_add_archive(
+        &mut self,
+        archive: u32,
+        index: &ArchiveIndex,
+        allocation_limit: usize,
+    ) -> Result<()> {
+        self.entries
+            .try_reserve(index.len())
+            .map_err(|_| CascError::LimitExceeded {
+                what: "aggregate CDN archive index entries",
+                limit: allocation_limit,
+            })?;
+        self.add_archive(archive, index);
+        Ok(())
     }
 
     /// Looks up an EKey across all archives added so far.
@@ -427,6 +468,13 @@ mod tests {
         // shortfall runs past the footer boundary itself.
         let mut data = build_page(4, &ascending_entries(1, 1));
         data.extend(build_footer(1, 4, 4, 4, 16, 8, 2));
+        let err = ArchiveIndex::parse(&data).unwrap_err();
+        assert!(matches!(err, CascError::Malformed { .. }));
+    }
+
+    #[test]
+    fn maximum_element_count_is_rejected_before_reservation() {
+        let data = build_footer(1, 4, 4, 4, 16, 8, u32::MAX);
         let err = ArchiveIndex::parse(&data).unwrap_err();
         assert!(matches!(err, CascError::Malformed { .. }));
     }

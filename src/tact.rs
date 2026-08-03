@@ -34,6 +34,8 @@ use crate::config::BuildInfo;
 use crate::error::{CascError, Result};
 use crate::keys::ContentKey;
 
+const MAX_CDN_HOSTS: usize = 8;
+
 /// One row of an NGDP `versions` response: the current build for one
 /// region.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,10 +162,18 @@ impl Cdns {
             let Some(path) = record.get("Path") else {
                 continue;
             };
-            let hosts: Vec<String> = record
-                .get("Hosts")
-                .map(|h| h.split_whitespace().map(str::to_string).collect())
-                .unwrap_or_default();
+            let mut hosts = Vec::new();
+            if let Some(value) = record.get("Hosts") {
+                for host in value.split_whitespace() {
+                    if hosts.len() >= MAX_CDN_HOSTS {
+                        return Err(CascError::LimitExceeded {
+                            what: "CDN hosts",
+                            limit: MAX_CDN_HOSTS,
+                        });
+                    }
+                    hosts.push(host.to_string());
+                }
+            }
             if hosts.is_empty() {
                 continue;
             }
@@ -202,6 +212,82 @@ pub fn cdns_url(region: &str, product: &str) -> String {
     format!("http://{region}.patch.battle.net:1119/{product}/cdns")
 }
 
+/// Validates caller-supplied discovery identifiers before they are placed in
+/// an authority or path component by [`versions_url`] / [`cdns_url`].
+pub(crate) fn validate_discovery_identifier(value: &str, what: &'static str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(CascError::malformed(
+            what,
+            "must contain only 1-64 ASCII letters, digits, '-' or '_'",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates the mutable host/path values returned by the plain-HTTP `cdns`
+/// endpoint. SC:R is served from Blizzard-owned DNS names; accepting an
+/// arbitrary authority here would allow a forged discovery response to turn
+/// the reader into an SSRF client, including during pinned opens.
+pub(crate) fn validate_cdn_location(hosts: &[String], path: &str) -> Result<()> {
+    if hosts.is_empty() {
+        return Err(CascError::malformed("CDN hosts", "host list is empty"));
+    }
+    if hosts.len() > MAX_CDN_HOSTS {
+        return Err(CascError::LimitExceeded {
+            what: "CDN hosts",
+            limit: MAX_CDN_HOSTS,
+        });
+    }
+    for host in hosts {
+        let host_lower = host.to_ascii_lowercase();
+        let dns_shape = host.len() <= 253
+            && host.split('.').all(|label| {
+                !label.is_empty()
+                    && label.len() <= 63
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                    && label
+                        .as_bytes()
+                        .first()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+                    && label
+                        .as_bytes()
+                        .last()
+                        .is_some_and(u8::is_ascii_alphanumeric)
+            });
+        if !dns_shape || !(host_lower == "blizzard.com" || host_lower.ends_with(".blizzard.com")) {
+            return Err(CascError::malformed(
+                "CDN host",
+                "must be a Blizzard-owned DNS hostname",
+            ));
+        }
+    }
+
+    if path.is_empty()
+        || path.len() > 1024
+        || path.split('/').any(|component| {
+            component.is_empty()
+                || component == "."
+                || component == ".."
+                || !component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+    {
+        return Err(CascError::malformed(
+            "CDN path",
+            "must be a plain relative ASCII path",
+        ));
+    }
+    Ok(())
+}
+
 /// Which subtree of a CDN a file hash addresses, per [`cdn_file_url`].
 ///
 /// - `Config`: the file lives under `<cdn_path>/config/` and is addressed
@@ -226,28 +312,33 @@ pub enum CdnPathKind {
 ///
 /// `xx`/`yy` are the first two byte-pairs (four hex chars) of `hash_hex`,
 /// matching the local `config/`/`data/` sharding scheme (see
-/// [`crate::config::BuildInfoRecord::build_key`]). `hash_hex` must be a
-/// lowercase hex string at least 4 characters long — this function does no
-/// validation of it beyond slicing, since callers already hold a typed key
-/// ([`ContentKey`] or [`crate::keys::EncodingKey`]) and are expected to
-/// format it themselves (e.g. via `Display`).
+/// [`crate::config::BuildInfoRecord::build_key`]). The hash must be exactly
+/// 32 ASCII hexadecimal characters. This rejects malformed archive names
+/// from CDN configs rather than slicing them and panicking.
 pub fn cdn_file_url(
     host: &str,
     cdn_path: &str,
     kind: CdnPathKind,
     hash_hex: &str,
     index: bool,
-) -> String {
+) -> Result<String> {
+    if hash_hex.len() != ContentKey::LENGTH * 2 || !hash_hex.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(CascError::malformed(
+            "CDN content address",
+            "hash must be exactly 32 hexadecimal characters",
+        ));
+    }
     let kind_str = match kind {
         CdnPathKind::Config => "config",
         CdnPathKind::Data => "data",
     };
     let suffix = if index { ".index" } else { "" };
-    format!(
+    Ok(format!(
         "http://{host}/{cdn_path}/{kind_str}/{}/{}/{hash_hex}{suffix}",
         &hash_hex[0..2],
         &hash_hex[2..4],
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -371,6 +462,22 @@ us|tpr/sc1live|level3.blizzard.com us.cdn.blizzard.com|http://level3.blizzard.co
     }
 
     #[test]
+    fn cdns_rejects_excessive_host_fallbacks() {
+        let hosts = (0..=MAX_CDN_HOSTS)
+            .map(|i| format!("cdn{i}.blizzard.com"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let text = format!("Name!STRING:0|Path!STRING:0|Hosts!STRING:0\nus|tpr/sc1live|{hosts}\n");
+        assert!(matches!(
+            Cdns::parse(&text),
+            Err(CascError::LimitExceeded {
+                what: "CDN hosts",
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn cdns_skips_row_with_empty_path() {
         let text = "Name!STRING:0|Path!STRING:0|Hosts!STRING:0\n\
                      kr||host.example\n\
@@ -425,7 +532,8 @@ us|tpr/sc1live|level3.blizzard.com us.cdn.blizzard.com|http://level3.blizzard.co
             CdnPathKind::Config,
             "864772b9ff94f6d372aa4ee90ee2f8ab",
             false,
-        );
+        )
+        .unwrap();
         assert_eq!(
             url,
             "http://us.cdn.blizzard.com/tpr/sc1live/config/86/47/864772b9ff94f6d372aa4ee90ee2f8ab"
@@ -440,10 +548,58 @@ us|tpr/sc1live|level3.blizzard.com us.cdn.blizzard.com|http://level3.blizzard.co
             CdnPathKind::Data,
             "b135dde729b026904eeb4b7e76332750",
             true,
-        );
+        )
+        .unwrap();
         assert_eq!(
             url,
             "http://level3.blizzard.com/tpr/sc1live/data/b1/35/b135dde729b026904eeb4b7e76332750.index"
         );
+    }
+
+    #[test]
+    fn cdn_file_url_rejects_malformed_hashes() {
+        for hash in ["", "abcd", "z64772b9ff94f6d372aa4ee90ee2f8ab"] {
+            let err = cdn_file_url("host", "path", CdnPathKind::Data, hash, false).unwrap_err();
+            assert!(matches!(err, CascError::Malformed { .. }));
+        }
+    }
+
+    #[test]
+    fn discovery_identifiers_reject_url_syntax() {
+        for value in ["", "us.example", "us@127.0.0.1", "../s1", "s1/versions"] {
+            assert!(validate_discovery_identifier(value, "test identifier").is_err());
+        }
+        assert!(validate_discovery_identifier("s1_beta-2", "test identifier").is_ok());
+    }
+
+    #[test]
+    fn cdn_location_rejects_untrusted_authorities_and_paths() {
+        assert!(
+            validate_cdn_location(
+                &[
+                    "level3.blizzard.com".to_string(),
+                    "us.cdn.blizzard.com".to_string()
+                ],
+                "tpr/sc1live"
+            )
+            .is_ok()
+        );
+        for host in [
+            "127.0.0.1",
+            "localhost",
+            "blizzard.com.attacker.test",
+            "user@blizzard.com",
+        ] {
+            assert!(validate_cdn_location(&[host.to_string()], "tpr/sc1live").is_err());
+        }
+        for path in [
+            "",
+            "/tpr/sc1live",
+            "tpr/../private",
+            "tpr//sc1live",
+            "tpr?x/y",
+        ] {
+            assert!(validate_cdn_location(&["cdn.blizzard.com".to_string()], path).is_err());
+        }
     }
 }

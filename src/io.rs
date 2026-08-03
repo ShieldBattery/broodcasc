@@ -6,13 +6,13 @@
 //! ([`FsProvider`]); WASM users can implement these traits over whatever byte
 //! source they have (OPFS sync access handles, in-memory buffers, ...).
 
-use crate::error::Result;
+use crate::error::{CascError, Result};
 
 /// Positioned reads from an immutable byte source.
 ///
 /// Implementations must be usable through `&self` (concurrent readers may
 /// share one handle), which is why this is not `std::io::Read`.
-pub trait ReadAt {
+pub trait ReadAt: Send + Sync {
     /// Reads exactly `buf.len()` bytes starting at `offset`, failing if the
     /// source ends first.
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()>;
@@ -26,7 +26,14 @@ pub trait ReadAt {
 
     /// Reads `len` bytes at `offset` into a new `Vec`.
     fn read_vec_at(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
-        let mut buf = vec![0u8; len];
+        let mut buf = Vec::new();
+        buf.try_reserve_exact(len).map_err(|_| {
+            CascError::malformed(
+                "positioned read",
+                "requested buffer is too large for memory",
+            )
+        })?;
+        buf.resize(len, 0);
         self.read_exact_at(offset, &mut buf)?;
         Ok(buf)
     }
@@ -77,7 +84,7 @@ impl<T: ReadAt + ?Sized> ReadAt for &T {
 /// Paths are relative to the storage's install root (the directory containing
 /// `.build.info`) and always use `/` as the separator (e.g. `".build.info"`,
 /// `"Data/data/000000001b.idx"`, `"Data/config/86/47/864772b9..."`).
-pub trait StorageProvider {
+pub trait StorageProvider: Send + Sync {
     type File: ReadAt;
 
     /// Opens a file for positioned reads (used for the large `data.###`
@@ -89,7 +96,10 @@ pub trait StorageProvider {
     fn read(&self, path: &str) -> Result<Vec<u8>> {
         let file = self.open(path)?;
         let len = file.len()?;
-        file.read_vec_at(0, len.try_into().expect("file too large for memory"))
+        let len = usize::try_from(len).map_err(|_| {
+            CascError::malformed("storage file", "file is too large for address space")
+        })?;
+        file.read_vec_at(0, len)
     }
 
     /// Lists the file names (not full paths) in a directory. Returns an empty
@@ -100,10 +110,13 @@ pub trait StorageProvider {
 #[cfg(feature = "fs")]
 mod fs_impl {
     use std::fs::File;
-    use std::path::{Path, PathBuf};
+    use std::path::{Component, Path, PathBuf};
 
     use super::{ReadAt, StorageProvider};
-    use crate::error::Result;
+    use crate::error::{CascError, Result};
+
+    const MAX_DIRECTORY_ENTRIES: usize = 100_000;
+    const MAX_DIRECTORY_NAME_BYTES: usize = 16 * 1024 * 1024;
 
     impl ReadAt for File {
         #[cfg(windows)]
@@ -149,10 +162,59 @@ mod fs_impl {
             FsProvider { root: root.into() }
         }
 
-        fn resolve(&self, path: &str) -> PathBuf {
+        fn resolve(&self, path: &str) -> Result<PathBuf> {
+            if path.is_empty() {
+                return Err(CascError::malformed("storage path", "path is empty"));
+            }
+            if path.contains('\\') {
+                return Err(CascError::malformed(
+                    "storage path",
+                    "backslash separators are not allowed",
+                ));
+            }
+            if path.contains('\0') {
+                return Err(CascError::malformed(
+                    "storage path",
+                    "NUL bytes are not allowed",
+                ));
+            }
+            if path
+                .split('/')
+                .any(|part| part.is_empty() || part == "." || part == "..")
+            {
+                return Err(CascError::malformed(
+                    "storage path",
+                    "path contains an empty, current-directory, or parent-directory component",
+                ));
+            }
+
+            let relative = Path::new(path);
+            if relative.is_absolute()
+                || relative
+                    .components()
+                    .any(|component| !matches!(component, Component::Normal(_)))
+            {
+                return Err(CascError::malformed(
+                    "storage path",
+                    "path is not a plain relative path",
+                ));
+            }
+
             let mut out = self.root.clone();
-            out.extend(path.split('/'));
-            out
+            out.push(relative);
+            Ok(out)
+        }
+
+        fn resolve_existing(&self, path: &str) -> Result<PathBuf> {
+            let root = std::fs::canonicalize(&self.root)?;
+            let resolved = std::fs::canonicalize(self.resolve(path)?)?;
+            if !resolved.starts_with(&root) {
+                return Err(CascError::malformed(
+                    "storage path",
+                    "resolved path escapes the storage root",
+                ));
+            }
+            Ok(resolved)
         }
 
         pub fn root(&self) -> &Path {
@@ -164,26 +226,110 @@ mod fs_impl {
         type File = File;
 
         fn open(&self, path: &str) -> Result<File> {
-            Ok(File::open(self.resolve(path))?)
-        }
-
-        fn read(&self, path: &str) -> Result<Vec<u8>> {
-            Ok(std::fs::read(self.resolve(path))?)
+            Ok(File::open(self.resolve_existing(path)?)?)
         }
 
         fn list_dir(&self, path: &str) -> Result<Vec<String>> {
-            let dir = self.resolve(path);
+            let dir = self.resolve(path)?;
             if !dir.is_dir() {
                 return Ok(Vec::new());
             }
+            let dir = self.resolve_existing(path)?;
             let mut out = Vec::new();
+            let mut name_bytes = 0usize;
             for entry in std::fs::read_dir(dir)? {
                 let entry = entry?;
                 if let Ok(name) = entry.file_name().into_string() {
+                    if out.len() >= MAX_DIRECTORY_ENTRIES {
+                        return Err(CascError::LimitExceeded {
+                            what: "storage directory entries",
+                            limit: MAX_DIRECTORY_ENTRIES,
+                        });
+                    }
+                    name_bytes =
+                        name_bytes
+                            .checked_add(name.len())
+                            .ok_or(CascError::LimitExceeded {
+                                what: "storage directory names",
+                                limit: MAX_DIRECTORY_NAME_BYTES,
+                            })?;
+                    if name_bytes > MAX_DIRECTORY_NAME_BYTES {
+                        return Err(CascError::LimitExceeded {
+                            what: "storage directory names",
+                            limit: MAX_DIRECTORY_NAME_BYTES,
+                        });
+                    }
                     out.push(name);
                 }
             }
             Ok(out)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn resolve_accepts_documented_relative_paths() {
+            let provider = FsProvider::new("install-root");
+            assert_eq!(
+                provider.resolve(".build.info").unwrap(),
+                Path::new("install-root").join(".build.info")
+            );
+            assert_eq!(
+                provider
+                    .resolve("Data/config/86/47/864772b9ff94f6d372aa4ee90ee2f8ab")
+                    .unwrap(),
+                Path::new("install-root")
+                    .join("Data/config/86/47/864772b9ff94f6d372aa4ee90ee2f8ab")
+            );
+        }
+
+        #[test]
+        fn resolve_rejects_root_escape_and_ambiguous_components() {
+            let provider = FsProvider::new("install-root");
+            for path in [
+                "",
+                "/absolute",
+                "../outside",
+                "Data/../outside",
+                "Data/./data",
+                "Data//data",
+                "Data/data/",
+                r"..\outside",
+                r"Data\data\file.idx",
+                "Data/data/\0file.idx",
+            ] {
+                assert!(provider.resolve(path).is_err(), "accepted {path:?}");
+            }
+        }
+
+        #[cfg(unix)]
+        #[test]
+        fn resolve_existing_rejects_symlink_escape() {
+            use std::os::unix::fs::symlink;
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let base = std::env::temp_dir().join(format!(
+                "broodcasc-provider-test-{}-{nonce}",
+                std::process::id()
+            ));
+            let root = base.join("root");
+            let outside = base.join("outside");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("secret"), b"outside root").unwrap();
+            symlink(&outside, root.join("escape")).unwrap();
+
+            let provider = FsProvider::new(&root);
+            assert!(provider.resolve_existing("escape/secret").is_err());
+
+            std::fs::remove_dir_all(&base).unwrap();
         }
     }
 }
@@ -195,6 +341,32 @@ pub use fs_impl::FsProvider;
 mod tests {
     use super::*;
 
+    struct HugeFile;
+
+    impl ReadAt for HugeFile {
+        fn read_exact_at(&self, _offset: u64, _buf: &mut [u8]) -> Result<()> {
+            panic!("oversized reads must fail before attempting I/O")
+        }
+
+        fn len(&self) -> Result<u64> {
+            Ok(u64::MAX)
+        }
+    }
+
+    struct HugeProvider;
+
+    impl StorageProvider for HugeProvider {
+        type File = HugeFile;
+
+        fn open(&self, _path: &str) -> Result<Self::File> {
+            Ok(HugeFile)
+        }
+
+        fn list_dir(&self, _path: &str) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+    }
+
     #[test]
     fn slice_read_at() {
         let data: &[u8] = &[1, 2, 3, 4, 5];
@@ -204,5 +376,28 @@ mod tests {
         assert!(data.read_exact_at(3, &mut buf).is_err());
         assert!(data.read_exact_at(u64::MAX, &mut buf).is_err());
         assert_eq!(ReadAt::len(data).unwrap(), 5);
+    }
+
+    #[test]
+    fn oversized_default_read_returns_error_without_allocating() {
+        assert!(HugeProvider.read("huge").is_err());
+    }
+
+    #[test]
+    fn public_io_types_are_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        fn assert_read_at<T: ReadAt>() {}
+        fn assert_provider<T: StorageProvider>() {}
+
+        assert_send_sync::<Vec<u8>>();
+        assert_read_at::<Vec<u8>>();
+        assert_provider::<HugeProvider>();
+
+        #[cfg(feature = "fs")]
+        {
+            assert_send_sync::<FsProvider>();
+            assert_read_at::<std::fs::File>();
+            assert_provider::<FsProvider>();
+        }
     }
 }

@@ -3,7 +3,7 @@
 //!
 //! The usual entry point is [`Storage`]:
 //!
-//! ```no_run
+//! ```ignore
 //! # fn main() -> Result<(), broodcasc::CascError> {
 //! let storage = broodcasc::Storage::open(r"C:\Program Files (x86)\StarCraft")?;
 //! let bytes = storage.read_file("SD/campaign/Starcraft/SWAR/staredit/scenario.chk")?;
@@ -24,14 +24,17 @@ pub mod encoding;
 pub mod error;
 pub mod idx;
 pub mod io;
+mod jenkins;
 pub mod keys;
+mod object;
 pub mod root;
 pub mod storage;
 #[cfg(feature = "cdn")]
 pub mod tact;
 
+pub use blte::ReadLimits;
 #[cfg(feature = "cdn")]
 pub use cdn::CdnStorage;
 pub use error::CascError;
 pub use keys::{ContentKey, EncodingKey, TruncatedKey};
-pub use storage::Storage;
+pub use storage::{Storage, StorageOptions};

@@ -18,7 +18,7 @@ Cross-reference source: [CascLib](https://github.com/ladislav-zezula/CascLib) �
 | Term | Meaning |
 |---|---|
 | **CKey** | Content Key. MD5 of the *decoded* (final) file content. 16 bytes. |
-| **EKey** | Encoded Key. MD5 of the *encoded* (BLTE) file data. 16 bytes, often truncated to 9. |
+| **EKey** | Encoded Key. An opaque 16-byte address for an encoded representation, emitted by the CASC encoding pipeline and often truncated to 9 bytes in local storage. It is **not** the MD5 of the stored bare BLTE bytes in SC:R. |
 | **span / archive entry** | One blob inside a `data.###` file: 30-byte header + BLTE stream. |
 | **BLTE** | The block-compression container every stored file is wrapped in. |
 | **bucket** | One of 16 local index shards, `00`..`0f`. |
@@ -30,8 +30,9 @@ Endianness is *mixed and inconsistent*. Rule of thumb, but always check the tabl
 - Everything inside **BLTE**, **ENCODING**, **INSTALL**, **DOWNLOAD** → **big-endian**.
 - The 30-byte span header's `EncodedSize` → **little-endian**.
 
-All hashes (`MD5`) are stored as raw bytes in the order produced by MD5, *except* the EKey in the
-30-byte span header, which is byte-**reversed**.
+All actual MD5 values (CKeys, BLTE chunk hashes, ENCODING page hashes) are stored as raw bytes in
+the order produced by MD5. EKeys are opaque identifiers rather than bare-BLTE MD5s; an EKey in a
+30-byte span header is stored byte-**reversed**.
 
 ---
 
@@ -137,7 +138,7 @@ build-playbuild-installer = ngdptool_casc2
 
 | Form | Token 1 | Token 2 |
 |---|---|---|
-| `<name> = <hash1> <hash2>` | **CKey** (MD5 of decoded content) | **EKey** (MD5 of BLTE-encoded data) |
+| `<name> = <hash1> <hash2>` | **CKey** (MD5 of decoded content) | **EKey** (opaque address of the encoded representation) |
 | `<name>-size = <n1> <n2>` | decoded (content) size | encoded size, **excluding** the 30-byte span header |
 | `root = <hash>` | **CKey only** — must be resolved via ENCODING | — |
 | `patch = <hash>` | **EKey only** (raw file, not BLTE) | — |
@@ -286,7 +287,8 @@ ENCODING/build-config to 9 bytes before lookup. 9 bytes = 72 bits; collisions ar
 concern (verified: none in this storage), but the reader must not attempt a 16-byte match here.
 
 See also the *reverse* caveat in §3.2: the span header in `data.###` sometimes stores a truncated
-EKey too, so you cannot verify all 16 bytes there either.
+EKey too, so only the 9-byte address prefix can be compared there; this is not a full-key integrity
+check.
 
 ---
 
@@ -430,6 +432,16 @@ The decoded whole-file bytes must MD5 to the **CKey**. Verified: decoded ENCODIN
 (matches build config), decoded ROOT → `b96213f2…` (matches build config), and 5 randomly sampled
 content files each matched the CKey from ROOT and the `ContentSize` from ENCODING exactly.
 
+Do **not** validate an object by checking `MD5(storedBareBLTE) == EKey`; that relation does not hold
+for this SC:R storage (see the measured ENCODING vector in §5). The layers establish different
+properties:
+
+| Layer | What it establishes |
+|---|---|
+| EKey → `.idx` entry → span-header EKey prefix | Addressing consistency: the located span is the one indexed for that opaque encoded key. Local indices and many span headers carry only the first 9 bytes. |
+| `.idx` guarded hashes and BLTE chunk MD5s | Detection of accidental corruption in the guarded index blocks and encoded chunks. These values travel with the data and are not an authenticity or trust anchor. |
+| Whole-file CKey | End-to-end integrity of the fully decoded content. Recompute it before returning a whole decoded object. MD5 is part of the format and detects corruption, but does not authenticate data against an active attacker. |
+
 ---
 
 ## 5. The ENCODING manifest
@@ -439,6 +451,16 @@ by EKey directly in the `.idx`, bypassing ENCODING itself (chicken-and-egg resol
 
 Verified: EKey `b135dde729b026904eeb4b7e76332750` → bucket lookup → `data.005` @ `0x3E89C843`,
 span size 2 757 872 → BLTE-decode → 2 757 673 bytes, MD5 `6f0a25d319069d1b09bc4034820e5ae0`.
+
+**EKey is not the MD5 of the stored bare BLTE (verified).** The 2 757 842 BLTE bytes beginning at
+`data.005` offset `0x3E89C843 + 30` have MD5
+`41a0bab262d0ca3d03ee21e40dd54974`, not the EKey
+`b135dde729b026904eeb4b7e76332750`. Hashing after excluding the first 8 BLTE header bytes, or
+hashing only the complete chunk table, also does not produce the EKey. Treat an EKey as an opaque
+encoded-representation address supplied by the build config or ENCODING manifest. Its exact writer
+derivation is not established here; it may incorporate an encoding header/specification or other
+pipeline metadata that is absent from the stored bare BLTE, so readers must not attempt to
+recompute or authenticate it from those bytes.
 
 ### 5.1 Header (22 bytes, at offset 0 of the decoded file)
 
@@ -677,7 +699,8 @@ Bootstrapping order for an implementation:
 6. `root` is a **CKey** → ENCODING → EKey → idx → BLTE-decode → parse the text root into
    `HashMap<lowercased path, CKey>`.
 7. Open a file: path → CKey → ENCODING → EKey → idx → seek `data.NNN` → skip/verify the 30-byte
-   header → read `encodedSize - 30` bytes → BLTE-decode → optionally verify `MD5 == CKey`.
+   header → read `encodedSize - 30` bytes → BLTE-decode → verify `MD5(decodedBytes) == CKey`
+   before returning the whole decoded object. Do not compare the bare BLTE MD5 to the EKey.
 
 Streaming note: BLTE's chunk table gives you `(encodedOffset, encodedSize, contentOffset,
 contentSize)` per chunk, so random access into a large file is a matter of locating the chunk that
@@ -752,6 +775,7 @@ specifically.
 |---|---|---|
 | `.idx` entry `EncodedSize` endianness | `CascStructs.h` comment says big-endian | **Little-endian** (CascLib's *code* agrees; the comment is wrong) |
 | ENCODING CKey entry header | wowdev.wiki: `uint16 keyCount; uint40 fileSize` | **`u8 keyCount; u40 BE fileSize`**. wowdev's u16 count desyncs on real data. CascLib's `u16 LE count + u32 BE size` happens to be numerically equivalent for count<256 and size<4 GiB. |
+| EKey derivation | Commonly described as MD5 of the stored encoded/BLTE bytes | **Not the MD5 of the stored bare BLTE in SC:R.** Treat it as an opaque encoded-representation address; exact derivation is not established here. |
 | Span header EKey | implied to always be the full 16-byte EKey | **1 665 of 40 542 spans store only 9 bytes + 7 zero bytes.** Compare 9 bytes only. |
 | Bucket hash function | `(xor of 9 key bytes) → (i & 0xF) ^ (i >> 4)`, universally | Holds for 40 542 / 40 718; the 176 placeholder stubs are stored in `computed + 1 (mod 16)`. Merge all buckets instead of relying on it. |
 | BLTE `'F'` mode | documented as recursive frames | Declared in `CascStructs.h` but **unimplemented in CascLib** and absent from SC:R. |

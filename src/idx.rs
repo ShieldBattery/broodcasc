@@ -13,7 +13,7 @@
 //! ```text
 //! 0x00  guarded-block header for the file header (8 bytes)
 //!         +0x00  BlockSize   u32 LE   (must be 0x10)
-//!         +0x04  BlockHash   u32 LE   (Jenkins hash; unverified by this reader)
+//!         +0x04  BlockHash   u32 LE   (Jenkins `hashlittle` of the file header)
 //! 0x08  file header (16 bytes)
 //!         +0x00  Revision         u16 LE   (must be 7)
 //!         +0x02  BucketIndex      u8       (unused here)
@@ -26,6 +26,7 @@
 //! 0x18  8 bytes of zero padding
 //! 0x20  guarded-block header for the entry array (8 bytes, same shape as above)
 //!         +0x00  BlockSize   u32 LE   (total bytes of the entry array)
+//!         +0x04  BlockHash   u32 LE   (chained Jenkins `hashlittle2`)
 //! 0x28  entry array: BlockSize / 18 entries of 18 bytes each
 //! ```
 //!
@@ -46,6 +47,7 @@
 use std::collections::HashMap;
 
 use crate::error::{CascError, Result};
+use crate::jenkins::{hashlittle, hashlittle2};
 use crate::keys::{EncodingKey, TruncatedKey};
 
 const GUARD_HEADER_LEN: usize = 8;
@@ -56,6 +58,19 @@ const ENTRIES_OFFSET: usize = 0x28;
 const ENTRY_LEN: usize = 18;
 const HEADER_BLOCK_SIZE: u32 = 0x10;
 const SEGMENT_BITS_RANGE: std::ops::RangeInclusive<u8> = 16..=39;
+/// SC:R has only tens of thousands of local entries. A much larger table is
+/// not a supported storage and would otherwise amplify a bounded `.idx`
+/// buffer into an unbounded hash-table allocation.
+const MAX_INDEX_ENTRIES: usize = 1_000_000;
+
+fn entry_block_hash(entries: &[u8]) -> u32 {
+    let mut hi = 0;
+    let mut lo = 0;
+    for entry in entries.chunks_exact(ENTRY_LEN) {
+        (hi, lo) = hashlittle2(entry, hi, lo);
+    }
+    hi
+}
 
 /// Where an encoded file span lives in the data archives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +154,12 @@ impl LocalIndex {
         Ok(LocalIndex { entries })
     }
 
+    /// Parses one additional selected bucket file. Storage bootstrap uses
+    /// this to release each raw `.idx` buffer before reading the next one.
+    pub(crate) fn add_file(&mut self, data: &[u8]) -> Result<()> {
+        parse_file(data, &mut self.entries)
+    }
+
     /// Looks up a full encoding key, truncating it to 9 bytes internally (as
     /// local indices only ever store the truncated form).
     pub fn lookup(&self, key: &EncodingKey) -> Option<&IdxEntry> {
@@ -191,6 +212,10 @@ fn parse_file(data: &[u8], out: &mut HashMap<TruncatedKey, IdxEntry>) -> Result<
     }
 
     let header = &data[FILE_HEADER_OFFSET..FILE_HEADER_OFFSET + FILE_HEADER_LEN];
+    let expected_header_hash = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    if hashlittle(header, 0) != expected_header_hash {
+        return Err(CascError::ChecksumMismatch("local index file header"));
+    }
     let revision = u16::from_le_bytes(header[0..2].try_into().unwrap());
     if revision != 7 {
         return Err(CascError::Unsupported {
@@ -261,7 +286,30 @@ fn parse_file(data: &[u8], out: &mut HashMap<TruncatedKey, IdxEntry>) -> Result<
         ));
     }
 
-    for entry in data[ENTRIES_OFFSET..entries_end].chunks_exact(ENTRY_LEN) {
+    let entry_bytes = &data[ENTRIES_OFFSET..entries_end];
+    let expected_entry_hash = u32::from_le_bytes(
+        data[ENTRIES_GUARD_OFFSET + 4..ENTRIES_GUARD_OFFSET + GUARD_HEADER_LEN]
+            .try_into()
+            .unwrap(),
+    );
+    if entry_block_hash(entry_bytes) != expected_entry_hash {
+        return Err(CascError::ChecksumMismatch("local index entry array"));
+    }
+
+    let entry_count = entry_block_size / ENTRY_LEN;
+    if out.len().saturating_add(entry_count) > MAX_INDEX_ENTRIES {
+        return Err(CascError::LimitExceeded {
+            what: "local index entries",
+            limit: MAX_INDEX_ENTRIES,
+        });
+    }
+    out.try_reserve(entry_count)
+        .map_err(|_| CascError::LimitExceeded {
+            what: "local index entries",
+            limit: MAX_INDEX_ENTRIES,
+        })?;
+
+    for entry in entry_bytes.chunks_exact(ENTRY_LEN) {
         let mut key9 = [0u8; 9];
         key9.copy_from_slice(&entry[0..9]);
 
@@ -305,15 +353,14 @@ mod tests {
 
     /// Builds a valid `.idx` (v7) file from raw entry tuples: `(key9,
     /// storage_offset as 5 raw big-endian bytes, encoded_size)`. Mirrors the
-    /// on-disk layout exactly; guarded-block hashes are left as garbage since
-    /// this reader doesn't verify them.
+    /// on-disk layout exactly, including both guarded-block hashes.
     fn build_idx_file(segment_bits: u8, entries: &[([u8; 9], [u8; 5], u32)]) -> Vec<u8> {
         let entry_block_size = (entries.len() * ENTRY_LEN) as u32;
 
         let mut out = Vec::new();
         // File header guarded block.
         out.extend_from_slice(&HEADER_BLOCK_SIZE.to_le_bytes());
-        out.extend_from_slice(&0xDEAD_BEEFu32.to_le_bytes()); // BlockHash, unverified
+        out.extend_from_slice(&0u32.to_le_bytes()); // BlockHash, filled below
 
         // File header (16 bytes).
         out.extend_from_slice(&7u16.to_le_bytes()); // Revision
@@ -324,13 +371,14 @@ mod tests {
         out.push(9); // KeyBytes
         out.push(segment_bits); // SegmentBits
         out.extend_from_slice(&0x0000_00FF_C000_0000u64.to_le_bytes()); // MaxFileOffset
+        update_header_hash(&mut out);
 
         // 8 bytes zero padding.
         out.extend_from_slice(&[0u8; 8]);
 
         // Entries guarded block header.
         out.extend_from_slice(&entry_block_size.to_le_bytes());
-        out.extend_from_slice(&0xCAFE_BABEu32.to_le_bytes()); // BlockHash, unverified
+        out.extend_from_slice(&0u32.to_le_bytes()); // BlockHash, filled below
 
         // Entries.
         for (key9, storage_offset, encoded_size) in entries {
@@ -338,8 +386,18 @@ mod tests {
             out.extend_from_slice(storage_offset);
             out.extend_from_slice(&encoded_size.to_le_bytes());
         }
+        let hash = entry_block_hash(&out[ENTRIES_OFFSET..]);
+        out[ENTRIES_GUARD_OFFSET + 4..ENTRIES_OFFSET].copy_from_slice(&hash.to_le_bytes());
 
         out
+    }
+
+    fn update_header_hash(data: &mut [u8]) {
+        let hash = hashlittle(
+            &data[FILE_HEADER_OFFSET..FILE_HEADER_OFFSET + FILE_HEADER_LEN],
+            0,
+        );
+        data[4..8].copy_from_slice(&hash.to_le_bytes());
     }
 
     /// Packs `(archive, offset)` into 5 raw big-endian bytes given
@@ -352,6 +410,68 @@ mod tests {
 
     fn key9(byte: u8) -> [u8; 9] {
         [byte; 9]
+    }
+
+    #[test]
+    fn documented_real_header_hash_matches() {
+        // docs/casc-format.md §2.2, bytes +0x08..+0x17 from
+        // 000000001b.idx. The guarded header stores 0x1bc0046b.
+        let header = [
+            0x07, 0x00, 0x00, 0x00, 0x04, 0x05, 0x09, 0x1e, 0x00, 0x00, 0x00, 0xc0, 0xff, 0x00,
+            0x00, 0x00,
+        ];
+        assert_eq!(hashlittle(&header, 0), 0x1bc0_046b);
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&HEADER_BLOCK_SIZE.to_le_bytes());
+        file.extend_from_slice(&0x1bc0_046bu32.to_le_bytes());
+        file.extend_from_slice(&header);
+        file.extend_from_slice(&[0; 8]);
+        file.extend_from_slice(&0u32.to_le_bytes());
+        file.extend_from_slice(&0u32.to_le_bytes());
+        assert!(
+            LocalIndex::from_files([file.as_slice()])
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn corrupt_header_payload_or_hash_is_rejected() {
+        let original = build_idx_file(30, &[]);
+
+        let mut bad_payload = original.clone();
+        bad_payload[FILE_HEADER_OFFSET + 8] ^= 1;
+        assert!(matches!(
+            LocalIndex::from_files([bad_payload.as_slice()]),
+            Err(CascError::ChecksumMismatch("local index file header"))
+        ));
+
+        let mut bad_hash = original;
+        bad_hash[4] ^= 1;
+        assert!(matches!(
+            LocalIndex::from_files([bad_hash.as_slice()]),
+            Err(CascError::ChecksumMismatch("local index file header"))
+        ));
+    }
+
+    #[test]
+    fn corrupt_entry_payload_or_hash_is_rejected() {
+        let original = build_idx_file(30, &[(key9(1), pack_storage_offset(0, 10, 30), 100)]);
+
+        let mut bad_payload = original.clone();
+        bad_payload[ENTRIES_OFFSET + 3] ^= 1;
+        assert!(matches!(
+            LocalIndex::from_files([bad_payload.as_slice()]),
+            Err(CascError::ChecksumMismatch("local index entry array"))
+        ));
+
+        let mut bad_hash = original;
+        bad_hash[ENTRIES_GUARD_OFFSET + 4] ^= 1;
+        assert!(matches!(
+            LocalIndex::from_files([bad_hash.as_slice()]),
+            Err(CascError::ChecksumMismatch("local index entry array"))
+        ));
     }
 
     #[test]
@@ -413,6 +533,7 @@ mod tests {
     fn wrong_revision_is_rejected() {
         let mut data = build_idx_file(30, &[(key9(1), pack_storage_offset(0, 0, 30), 100)]);
         data[FILE_HEADER_OFFSET..FILE_HEADER_OFFSET + 2].copy_from_slice(&6u16.to_le_bytes());
+        update_header_hash(&mut data);
         let err = LocalIndex::from_files([data.as_slice()]).unwrap_err();
         assert!(matches!(err, CascError::Unsupported { .. }));
     }
@@ -421,6 +542,7 @@ mod tests {
     fn wrong_key_bytes_rejected_as_unsupported() {
         let mut data = build_idx_file(30, &[(key9(1), pack_storage_offset(0, 0, 30), 100)]);
         data[FILE_HEADER_OFFSET + 6] = 16; // KeyBytes
+        update_header_hash(&mut data);
         let err = LocalIndex::from_files([data.as_slice()]).unwrap_err();
         assert!(matches!(err, CascError::Unsupported { .. }));
     }
@@ -429,6 +551,7 @@ mod tests {
     fn nonzero_flags_rejected_as_unsupported() {
         let mut data = build_idx_file(30, &[(key9(1), pack_storage_offset(0, 0, 30), 100)]);
         data[FILE_HEADER_OFFSET + 3] = 1; // Flags
+        update_header_hash(&mut data);
         let err = LocalIndex::from_files([data.as_slice()]).unwrap_err();
         assert!(matches!(err, CascError::Unsupported { .. }));
     }
