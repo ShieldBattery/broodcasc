@@ -48,7 +48,7 @@ impl RootFile {
     /// zero records is rejected as malformed since it almost certainly means
     /// the input isn't a root file at all.
     pub fn parse(data: &[u8]) -> Result<RootFile> {
-        let text = str::from_utf8(data)
+        let text = std::str::from_utf8(data)
             .map_err(|_| CascError::malformed("root file", "not valid UTF-8"))?;
 
         let mut entries = Vec::new();
@@ -145,7 +145,10 @@ mod tests {
             .lookup(r"sd\Campaign\starcraft\swar\STAREDIT\scenario.chk")
             .expect("should find the entry");
         // Original casing is preserved in the returned entry.
-        assert_eq!(entry.path, "SD/campaign/Starcraft/SWAR/staredit/scenario.chk");
+        assert_eq!(
+            entry.path,
+            "SD/campaign/Starcraft/SWAR/staredit/scenario.chk"
+        );
         assert!(root.lookup("sd/campaign/missing.chk").is_none());
     }
 
@@ -170,7 +173,8 @@ mod tests {
 
     #[test]
     fn bare_lf_is_accepted() {
-        let text = "a/b.wav|316b0274bf2dabaa8db60c3ff1270c85\nc/d.wav|6637ed776bd22089e083b8b0b2c0374c\n";
+        let text =
+            "a/b.wav|316b0274bf2dabaa8db60c3ff1270c85\nc/d.wav|6637ed776bd22089e083b8b0b2c0374c\n";
         let root = assert_ok!(RootFile::parse(text.as_bytes()));
         assert_eq!(root.len(), 2);
     }

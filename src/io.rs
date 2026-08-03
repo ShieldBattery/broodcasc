@@ -74,9 +74,9 @@ impl<T: ReadAt + ?Sized> ReadAt for &T {
 
 /// Provides access to the files that make up a CASC storage.
 ///
-/// Paths are relative to the storage's `Data` directory and always use `/` as
-/// the separator (e.g. `"data/000000001b.idx"`,
-/// `"config/86/47/864772b9..."`).
+/// Paths are relative to the storage's install root (the directory containing
+/// `.build.info`) and always use `/` as the separator (e.g. `".build.info"`,
+/// `"Data/data/000000001b.idx"`, `"Data/config/86/47/864772b9..."`).
 pub trait StorageProvider {
     type File: ReadAt;
 
@@ -142,9 +142,9 @@ mod fs_impl {
     }
 
     impl FsProvider {
-        /// Creates a provider rooted at a CASC data directory (the directory
-        /// containing `config/` and `data/`, e.g.
-        /// `C:\Program Files (x86)\StarCraft\Data`).
+        /// Creates a provider rooted at a CASC install directory (the
+        /// directory containing `.build.info` and `Data/`, e.g.
+        /// `C:\Program Files (x86)\StarCraft`).
         pub fn new(root: impl Into<PathBuf>) -> Self {
             FsProvider { root: root.into() }
         }

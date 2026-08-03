@@ -6,6 +6,7 @@
 
 pub mod blte;
 pub mod config;
+pub mod encoding;
 pub mod error;
 pub mod io;
 pub mod keys;
