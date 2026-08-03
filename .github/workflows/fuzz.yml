@@ -28,7 +28,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz -> target
-      - uses: taiki-e/install-action@cargo-fuzz
+      # Plain cargo install: cargo-fuzz has no prebuilt binaries for
+      # install-action, and rust-cache restores ~/.cargo/bin so this is a
+      # no-op on warm caches.
+      - run: cargo install cargo-fuzz --locked
       - run: >
           cargo fuzz run ${{ matrix.target }} fuzz/seeds/${{ matrix.target }}
           -- -max_total_time=20 -max_len=16384
@@ -54,7 +57,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: fuzz -> target
-      - uses: taiki-e/install-action@cargo-fuzz
+      # Plain cargo install: cargo-fuzz has no prebuilt binaries for
+      # install-action, and rust-cache restores ~/.cargo/bin so this is a
+      # no-op on warm caches.
+      - run: cargo install cargo-fuzz --locked
       - run: >
           cargo fuzz run ${{ matrix.target }} fuzz/seeds/${{ matrix.target }}
           -- -max_total_time=300 -max_len=16384
