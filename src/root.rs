@@ -48,7 +48,7 @@ impl RootFile {
     /// zero records is rejected as malformed since it almost certainly means
     /// the input isn't a root file at all.
     pub fn parse(data: &[u8]) -> Result<RootFile> {
-        let text = std::str::from_utf8(data)
+        let text = str::from_utf8(data)
             .map_err(|_| CascError::malformed("root file", "not valid UTF-8"))?;
 
         let mut entries = Vec::new();
