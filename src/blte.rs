@@ -320,6 +320,7 @@ fn decode_inner(data: &[u8], depth: u32) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// Builds a BLTE buffer with a chunk table from `(mode, payload)` pairs,
     /// where `payload` is the pre-mode-byte data (raw bytes for `N`, already
@@ -366,6 +367,25 @@ mod tests {
 
     fn zlib(data: &[u8]) -> Vec<u8> {
         miniz_oxide::deflate::compress_to_vec_zlib(data, 6)
+    }
+
+    /// Builds a valid chunk-table BLTE buffer from `(is_z, raw_payload)`
+    /// pairs, compressing the raw payload for `Z`-mode chunks. Used by the
+    /// property tests below to get a realistic, always-valid starting point.
+    fn build_valid_blte(raws: &[(bool, Vec<u8>)]) -> Vec<u8> {
+        let owned: Vec<Vec<u8>> = raws
+            .iter()
+            .map(|(is_z, raw)| if *is_z { zlib(raw) } else { raw.clone() })
+            .collect();
+        let chunks: Vec<(u8, &[u8], u32)> = raws
+            .iter()
+            .zip(&owned)
+            .map(|((is_z, raw), payload)| {
+                let mode = if *is_z { b'Z' } else { b'N' };
+                (mode, payload.as_slice(), raw.len() as u32)
+            })
+            .collect();
+        build_blte(&chunks)
     }
 
     #[test]
@@ -545,5 +565,89 @@ mod tests {
         let mut blte = build_blte(&[(b'N', b"hello", 5)]);
         blte[8] = 0x00;
         assert!(decode(&blte).is_err());
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Building a multi-chunk BLTE buffer from arbitrary raw/zlib chunks
+        /// and decoding it must reproduce the concatenation of the original
+        /// (uncompressed) payloads.
+        #[test]
+        fn prop_roundtrip_blte_chunk_table(
+            raws in proptest::collection::vec(
+                (any::<bool>(), proptest::collection::vec(any::<u8>(), 0..64)),
+                1..8,
+            )
+        ) {
+            let blte = build_valid_blte(&raws);
+            let decoded = decode(&blte).unwrap();
+            let mut expected = Vec::new();
+            for (_, raw) in &raws {
+                expected.extend_from_slice(raw);
+            }
+            prop_assert_eq!(decoded, expected);
+        }
+
+        /// Same, but for the `header_size == 0` single-implicit-chunk form.
+        #[test]
+        fn prop_roundtrip_blte_single_chunk(
+            is_z in any::<bool>(),
+            raw in proptest::collection::vec(any::<u8>(), 0..128),
+        ) {
+            let blte = if is_z {
+                build_single_chunk(b'Z', &zlib(&raw))
+            } else {
+                build_single_chunk(b'N', &raw)
+            };
+            let decoded = decode(&blte).unwrap();
+            prop_assert_eq!(decoded, raw);
+        }
+
+        /// Neither `decode` nor `BlteHeader::parse` should ever panic, no
+        /// matter what bytes they're fed.
+        #[test]
+        fn prop_no_panic_arbitrary_bytes(
+            data in proptest::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let _ = decode(&data);
+            let _ = BlteHeader::parse(&data);
+        }
+
+        /// Flipping a handful of bytes in an otherwise-valid BLTE buffer
+        /// should never panic, even though it usually breaks the checksum or
+        /// header invariants.
+        #[test]
+        fn prop_no_panic_flipped_bytes(
+            raws in proptest::collection::vec(
+                (any::<bool>(), proptest::collection::vec(any::<u8>(), 0..32)),
+                1..4,
+            ),
+            flips in proptest::collection::vec((any::<usize>(), any::<u8>()), 1..4),
+        ) {
+            let mut blte = build_valid_blte(&raws);
+            for (pos, xor) in &flips {
+                if !blte.is_empty() {
+                    let idx = pos % blte.len();
+                    blte[idx] ^= xor | 1;
+                }
+            }
+            let _ = decode(&blte);
+        }
+
+        /// Truncating an otherwise-valid BLTE buffer to an arbitrary length
+        /// should never panic.
+        #[test]
+        fn prop_no_panic_truncated(
+            raws in proptest::collection::vec(
+                (any::<bool>(), proptest::collection::vec(any::<u8>(), 0..32)),
+                1..4,
+            ),
+            trunc_len in any::<usize>(),
+        ) {
+            let blte = build_valid_blte(&raws);
+            let len = trunc_len % (blte.len() + 1);
+            let _ = decode(&blte[..len]);
+        }
     }
 }

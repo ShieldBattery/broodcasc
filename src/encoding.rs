@@ -300,9 +300,11 @@ impl Header {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// One entry to feed into [`build_encoding`]: a CKey, its (possibly
     /// multiple) EKeys, and the decoded size.
+    #[derive(Debug)]
     struct RawEntry {
         ckey: ContentKey,
         ekeys: Vec<EncodingKey>,
@@ -573,5 +575,91 @@ mod tests {
         let table = EncodingTable::parse(&data).unwrap();
         let found = table.lookup(&ContentKey([1; 16])).unwrap();
         assert_eq!(found.size, big_size);
+    }
+
+    /// Generates a strictly-increasing, unique-CKey list of [`RawEntry`]s:
+    /// sizes span the full u40 range, and each entry has 1-3 EKeys.
+    fn raw_entries_strategy() -> impl Strategy<Value = Vec<RawEntry>> {
+        proptest::collection::hash_set(any::<[u8; 16]>(), 1..20).prop_flat_map(|ckey_set| {
+            let mut ckeys: Vec<[u8; 16]> = ckey_set.into_iter().collect();
+            ckeys.sort();
+            let n = ckeys.len();
+            (
+                Just(ckeys),
+                proptest::collection::vec(0u64..(1u64 << 40), n),
+                proptest::collection::vec(proptest::collection::vec(any::<[u8; 16]>(), 1..=3), n),
+            )
+                .prop_map(|(ckeys, sizes, ekey_lists)| {
+                    ckeys
+                        .into_iter()
+                        .zip(sizes)
+                        .zip(ekey_lists)
+                        .map(|((ckey, size), ekeys)| RawEntry {
+                            ckey: ContentKey(ckey),
+                            ekeys: ekeys.into_iter().map(EncodingKey).collect(),
+                            size,
+                        })
+                        .collect()
+                })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Building an encoding table from arbitrary strictly-increasing
+        /// unique-CKey entries and parsing it back must reproduce every
+        /// entry's (first EKey, size), and the total entry count.
+        #[test]
+        fn prop_roundtrip_encoding(entries in raw_entries_strategy()) {
+            let data = build_encoding(&entries, 1);
+            let table = EncodingTable::parse(&data).unwrap();
+            prop_assert_eq!(table.len(), entries.len());
+            for e in &entries {
+                let found = table.lookup(&e.ckey).unwrap();
+                prop_assert_eq!(found.ekey, e.ekeys[0]);
+                prop_assert_eq!(found.size, e.size);
+            }
+        }
+
+        /// `EncodingTable::parse` should never panic, no matter what bytes
+        /// it's fed.
+        #[test]
+        fn prop_no_panic_arbitrary_bytes(
+            data in proptest::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let _ = EncodingTable::parse(&data);
+        }
+
+        /// Flipping a handful of bytes in an otherwise-valid encoding table
+        /// should never panic.
+        #[test]
+        fn prop_no_panic_flipped_bytes(
+            n in 1u8..10u8,
+            flips in proptest::collection::vec((any::<usize>(), any::<u8>()), 1..4),
+        ) {
+            let entries: Vec<RawEntry> = (1..=n).map(|i| entry(i, i as u64 * 7)).collect();
+            let mut data = build_encoding(&entries, 1);
+            for (pos, xor) in &flips {
+                if !data.is_empty() {
+                    let idx = pos % data.len();
+                    data[idx] ^= xor | 1;
+                }
+            }
+            let _ = EncodingTable::parse(&data);
+        }
+
+        /// Truncating an otherwise-valid encoding table to an arbitrary
+        /// length should never panic.
+        #[test]
+        fn prop_no_panic_truncated(
+            n in 1u8..10u8,
+            trunc_len in any::<usize>(),
+        ) {
+            let entries: Vec<RawEntry> = (1..=n).map(|i| entry(i, i as u64 * 7)).collect();
+            let data = build_encoding(&entries, 1);
+            let len = trunc_len % (data.len() + 1);
+            let _ = EncodingTable::parse(&data[..len]);
+        }
     }
 }

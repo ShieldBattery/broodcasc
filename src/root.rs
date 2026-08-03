@@ -119,6 +119,7 @@ fn normalize_path(path: &str) -> String {
 mod tests {
     use super::*;
     use assert_ok::assert_ok;
+    use proptest::prelude::*;
 
     const SAMPLE: &str = "locales/enUS/Assets/campaign/EXPZerg/Zerg08/staredit/wav/zovtra01.ogg|316b0274bf2dabaa8db60c3ff1270c85\r\n\
         locales/zhCN/Assets/sound/terran/ghost/tghdth01.wav|6637ed776bd22089e083b8b0b2c0374c\r\n\
@@ -184,5 +185,91 @@ mod tests {
         assert!(RootFile::parse(b"").is_err());
         assert!(RootFile::parse(b"BLTE\x00\x01\x02").is_err());
         assert!(RootFile::parse(&[0xFF, 0xFE, 0x00]).is_err());
+    }
+
+    /// Printable-ASCII path character, excluding `|` (the field separator)
+    /// and the (already-excluded-by-range) `\r`/`\n` line terminators.
+    fn path_char() -> impl Strategy<Value = char> {
+        (0x20u8..=0x7eu8)
+            .prop_filter("no pipe", |&b| b != b'|')
+            .prop_map(|b| b as char)
+    }
+
+    fn path_string() -> impl Strategy<Value = String> {
+        proptest::collection::vec(path_char(), 1..24).prop_map(|cs| cs.into_iter().collect())
+    }
+
+    /// Generates a nonempty list of `(path, ckey)` pairs, deduplicated by
+    /// normalized path (as [`RootFile`] itself would key them) so every
+    /// generated path is independently look-up-able.
+    fn root_entries_strategy() -> impl Strategy<Value = Vec<(String, [u8; 16])>> {
+        proptest::collection::vec((path_string(), any::<[u8; 16]>()), 1..15)
+            .prop_map(|entries| {
+                let mut seen = std::collections::HashSet::new();
+                entries
+                    .into_iter()
+                    .filter(|(path, _)| seen.insert(normalize_path(path)))
+                    .collect::<Vec<_>>()
+            })
+            .prop_filter("need at least one entry after dedup", |v| !v.is_empty())
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Serializing arbitrary (deduplicated) path/CKey pairs as
+        /// `path|hex\r\n` lines and parsing them back must reproduce every
+        /// entry's CKey via lookup, plus the total count.
+        #[test]
+        fn prop_roundtrip_root(entries in root_entries_strategy()) {
+            let mut text = String::new();
+            for (path, ckey) in &entries {
+                text.push_str(path);
+                text.push('|');
+                for b in ckey {
+                    text.push_str(&format!("{b:02x}"));
+                }
+                text.push_str("\r\n");
+            }
+
+            let root = RootFile::parse(text.as_bytes()).unwrap();
+            prop_assert_eq!(root.len(), entries.len());
+            for (path, ckey) in &entries {
+                let found = root.lookup(path).unwrap();
+                prop_assert_eq!(found.ckey, ContentKey(*ckey));
+            }
+        }
+
+        /// `RootFile::parse` should never panic, no matter what string it's
+        /// fed.
+        #[test]
+        fn prop_no_panic_arbitrary_string(s in any::<String>()) {
+            let _ = RootFile::parse(s.as_bytes());
+        }
+
+        /// Flipping a handful of bytes in an otherwise-valid root file
+        /// (which may break UTF-8 validity) should never panic.
+        #[test]
+        fn prop_no_panic_flipped_bytes(
+            flips in proptest::collection::vec((any::<usize>(), any::<u8>()), 1..4),
+        ) {
+            let mut data = SAMPLE.as_bytes().to_vec();
+            for (pos, xor) in &flips {
+                if !data.is_empty() {
+                    let idx = pos % data.len();
+                    data[idx] ^= xor | 1;
+                }
+            }
+            let _ = RootFile::parse(&data);
+        }
+
+        /// Truncating an otherwise-valid root file to an arbitrary length
+        /// should never panic.
+        #[test]
+        fn prop_no_panic_truncated(trunc_len in any::<usize>()) {
+            let data = SAMPLE.as_bytes();
+            let len = trunc_len % (data.len() + 1);
+            let _ = RootFile::parse(&data[..len]);
+        }
     }
 }

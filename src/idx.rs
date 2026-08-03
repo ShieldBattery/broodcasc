@@ -301,6 +301,7 @@ fn parse_file(data: &[u8], out: &mut HashMap<TruncatedKey, IdxEntry>) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// Builds a valid `.idx` (v7) file from raw entry tuples: `(key9,
     /// storage_offset as 5 raw big-endian bytes, encoded_size)`. Mirrors the
@@ -545,5 +546,114 @@ mod tests {
         assert!(index.is_empty());
         assert_eq!(index.len(), 0);
         assert_eq!(index.entries().count(), 0);
+    }
+
+    /// One generated round-trip entry: `(key9, archive, offset, encoded_size)`.
+    type IdxRoundTripEntry = ([u8; 9], u16, u64, u32);
+
+    /// Generates `(segment_bits, entries)` where each entry has a unique
+    /// 9-byte key, an archive number that fits both in a `u16` and in
+    /// whatever bits `segment_bits` leaves for it, an offset `< 2^segment_bits`,
+    /// and a size `> 30` (so it's never treated as a placeholder span).
+    fn idx_round_trip_strategy() -> impl Strategy<Value = (u8, Vec<IdxRoundTripEntry>)> {
+        (16u8..=39u8).prop_flat_map(|segment_bits| {
+            let avail_archive_bits = 40 - segment_bits as u32;
+            let max_archive: u64 = if avail_archive_bits >= 16 {
+                u16::MAX as u64
+            } else {
+                (1u64 << avail_archive_bits) - 1
+            };
+            let max_offset: u64 = (1u64 << segment_bits) - 1;
+
+            proptest::collection::hash_set(any::<[u8; 9]>(), 1..12).prop_flat_map(move |keys| {
+                let keys: Vec<[u8; 9]> = keys.into_iter().collect();
+                let n = keys.len();
+                (
+                    Just(keys),
+                    proptest::collection::vec(0..=max_archive, n),
+                    proptest::collection::vec(0..=max_offset, n),
+                    proptest::collection::vec(31u32..1_000_000u32, n),
+                )
+                    .prop_map(move |(keys, archives, offsets, sizes)| {
+                        let entries = keys
+                            .into_iter()
+                            .zip(archives)
+                            .zip(offsets)
+                            .zip(sizes)
+                            .map(|(((k, a), o), s)| (k, a as u16, o, s))
+                            .collect();
+                        (segment_bits, entries)
+                    })
+            })
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Building an `.idx` file from arbitrary valid entries and parsing
+        /// it back must reproduce the exact (archive, offset, size) for
+        /// every key.
+        #[test]
+        fn prop_roundtrip_idx((segment_bits, entries) in idx_round_trip_strategy()) {
+            let raw_entries: Vec<([u8; 9], [u8; 5], u32)> = entries
+                .iter()
+                .map(|&(key, archive, offset, size)| {
+                    (key, pack_storage_offset(archive, offset, segment_bits), size)
+                })
+                .collect();
+            let data = build_idx_file(segment_bits, &raw_entries);
+            let index = LocalIndex::from_files([data.as_slice()]).unwrap();
+            prop_assert_eq!(index.len(), entries.len());
+            for &(key, archive, offset, size) in &entries {
+                let found = index.lookup_truncated(&TruncatedKey(key)).unwrap();
+                prop_assert_eq!(found.archive, archive);
+                prop_assert_eq!(found.offset, offset);
+                prop_assert_eq!(found.encoded_size, size);
+            }
+        }
+
+        /// `LocalIndex::from_files` with a single file should never panic,
+        /// no matter what bytes it's fed.
+        #[test]
+        fn prop_no_panic_arbitrary_bytes(
+            data in proptest::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let _ = LocalIndex::from_files([data.as_slice()]);
+        }
+
+        /// Flipping a handful of bytes in an otherwise-valid `.idx` file
+        /// should never panic.
+        #[test]
+        fn prop_no_panic_flipped_bytes(
+            segment_bits in 16u8..=39u8,
+            flips in proptest::collection::vec((any::<usize>(), any::<u8>()), 1..4),
+        ) {
+            let entries = vec![
+                (key9(1), pack_storage_offset(0, 0, segment_bits), 100u32),
+                (key9(2), pack_storage_offset(0, 1, segment_bits), 200u32),
+            ];
+            let mut data = build_idx_file(segment_bits, &entries);
+            for (pos, xor) in &flips {
+                if !data.is_empty() {
+                    let idx = pos % data.len();
+                    data[idx] ^= xor | 1;
+                }
+            }
+            let _ = LocalIndex::from_files([data.as_slice()]);
+        }
+
+        /// Truncating an otherwise-valid `.idx` file to an arbitrary length
+        /// should never panic.
+        #[test]
+        fn prop_no_panic_truncated(
+            segment_bits in 16u8..=39u8,
+            trunc_len in any::<usize>(),
+        ) {
+            let entries = vec![(key9(1), pack_storage_offset(0, 0, segment_bits), 100u32)];
+            let data = build_idx_file(segment_bits, &entries);
+            let len = trunc_len % (data.len() + 1);
+            let _ = LocalIndex::from_files([&data[..len]]);
+        }
     }
 }

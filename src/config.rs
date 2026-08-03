@@ -254,6 +254,7 @@ impl BuildConfig {
 mod tests {
     use super::*;
     use assert_ok::assert_ok;
+    use proptest::prelude::*;
 
     const BUILD_INFO_SAMPLE: &str = "Branch!STRING:0|Active!DEC:1|Build Key!HEX:16|CDN Key!HEX:16|Install Key!HEX:16|IM Size!DEC:4|CDN Path!STRING:0|CDN Hosts!STRING:0|CDN Servers!STRING:0|Tags!STRING:0|Armadillo!STRING:0|Last Activated!STRING:0|Version!STRING:0|KeyRing!HEX:16|Product!STRING:0\nus|1|864772b9ff94f6d372aa4ee90ee2f8ab|bd4a0f876fdbf39666f0fae661e54974|||tpr/sc1live|level3.blizzard.com us.cdn.blizzard.com|http://...|Windows noigr...|||1.23.10.13515||\n";
 
@@ -468,5 +469,182 @@ build-playbuild-installer = ngdptool_casc2
     #[test]
     fn build_config_rejects_line_without_equals() {
         assert!(BuildConfig::parse("this line has no equals sign\n").is_err());
+    }
+
+    // --- Property tests ---
+
+    fn config_key_char() -> impl Strategy<Value = char> {
+        prop_oneof![Just('-'), (b'a'..=b'z').prop_map(|b| b as char)]
+    }
+
+    fn config_key() -> impl Strategy<Value = String> {
+        proptest::collection::vec(config_key_char(), 1..12).prop_map(|cs| cs.into_iter().collect())
+    }
+
+    /// Visible, non-whitespace printable ASCII: already "trimmed" by
+    /// construction (no leading/trailing whitespace to strip), so the
+    /// round-trip can compare directly against what was generated.
+    fn config_value() -> impl Strategy<Value = String> {
+        proptest::collection::vec((0x21u8..=0x7eu8).prop_map(|b| b as char), 1..16)
+            .prop_map(|cs| cs.into_iter().collect::<String>())
+            .prop_filter("not a comment", |v: &String| !v.starts_with('#'))
+    }
+
+    /// Unique-by-key list of `(key, value)` pairs for [`BuildConfig`].
+    fn config_entries_strategy() -> impl Strategy<Value = Vec<(String, String)>> {
+        proptest::collection::vec((config_key(), config_value()), 1..12).prop_map(|entries| {
+            let mut seen = std::collections::HashSet::new();
+            entries
+                .into_iter()
+                .filter(|(k, _)| seen.insert(k.clone()))
+                .collect()
+        })
+    }
+
+    fn info_col_name() -> impl Strategy<Value = String> {
+        proptest::collection::vec((b'a'..=b'z').prop_map(|b| b as char), 1..8)
+            .prop_map(|cs| cs.into_iter().collect())
+    }
+
+    /// Printable ASCII excluding `|` (the field separator) and newlines
+    /// (already excluded by the printable range).
+    fn info_value() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            (0x20u8..=0x7eu8)
+                .prop_filter("no pipe", |&b| b != b'|')
+                .prop_map(|b| b as char),
+            1..12,
+        )
+        .prop_map(|cs| cs.into_iter().collect())
+    }
+
+    /// At least 2 unique column names, so a serialized record line always
+    /// contains at least one `|` and can never be mistaken for a blank line.
+    fn info_columns_strategy() -> impl Strategy<Value = Vec<String>> {
+        proptest::collection::vec(info_col_name(), 2..6)
+            .prop_map(|cols| {
+                let mut seen = std::collections::HashSet::new();
+                cols.into_iter()
+                    .filter(|c| seen.insert(c.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .prop_filter("need >= 2 unique columns", |cols: &Vec<String>| {
+                cols.len() >= 2
+            })
+    }
+
+    fn build_info_strategy() -> impl Strategy<Value = (Vec<String>, Vec<Vec<Option<String>>>)> {
+        info_columns_strategy().prop_flat_map(|cols| {
+            let n = cols.len();
+            (
+                Just(cols),
+                proptest::collection::vec(
+                    proptest::collection::vec(proptest::option::of(info_value()), n),
+                    1..6,
+                ),
+            )
+        })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// Serializing arbitrary unique `key = value` pairs and parsing them
+        /// back via [`BuildConfig::parse`] must reproduce every value.
+        #[test]
+        fn prop_roundtrip_build_config(entries in config_entries_strategy()) {
+            let mut text = String::new();
+            for (k, v) in &entries {
+                text.push_str(&format!("{k} = {v}\n"));
+            }
+            let config = BuildConfig::parse(&text).unwrap();
+            for (k, v) in &entries {
+                prop_assert_eq!(config.get(k), Some(v.as_str()));
+            }
+        }
+
+        /// Serializing an arbitrary header + records table and parsing it
+        /// back via [`BuildInfo::parse`] must reproduce every column value
+        /// (with empty values mapping to `None`), plus the record count.
+        #[test]
+        fn prop_roundtrip_build_info((columns, records) in build_info_strategy()) {
+            let header = columns
+                .iter()
+                .map(|c| format!("{c}!STRING:0"))
+                .collect::<Vec<_>>()
+                .join("|");
+            let mut text = header;
+            text.push('\n');
+            for record in &records {
+                let line = record
+                    .iter()
+                    .map(|v| v.clone().unwrap_or_default())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                text.push_str(&line);
+                text.push('\n');
+            }
+
+            let info = BuildInfo::parse(&text).unwrap();
+            prop_assert_eq!(info.records().len(), records.len());
+            for (rec, expected) in info.records().iter().zip(&records) {
+                for (col, val) in columns.iter().zip(expected) {
+                    prop_assert_eq!(rec.get(col), val.as_deref());
+                }
+            }
+        }
+
+        /// Neither `BuildConfig::parse` nor `BuildInfo::parse` should ever
+        /// panic, no matter what (lossily-decoded) bytes they're fed.
+        #[test]
+        fn prop_no_panic_arbitrary_bytes(
+            data in proptest::collection::vec(any::<u8>(), 0..2048)
+        ) {
+            let s = String::from_utf8_lossy(&data);
+            let _ = BuildConfig::parse(&s);
+            let _ = BuildInfo::parse(&s);
+        }
+
+        /// Flipping a handful of bytes in otherwise-valid config/info files
+        /// (lossily re-decoded to UTF-8) should never panic.
+        #[test]
+        fn prop_no_panic_flipped_bytes(
+            flips in proptest::collection::vec((any::<usize>(), any::<u8>()), 1..4),
+        ) {
+            let mut data = BUILD_CONFIG_SAMPLE.as_bytes().to_vec();
+            for (pos, xor) in &flips {
+                if !data.is_empty() {
+                    let idx = pos % data.len();
+                    data[idx] ^= xor | 1;
+                }
+            }
+            let s = String::from_utf8_lossy(&data).into_owned();
+            let _ = BuildConfig::parse(&s);
+
+            let mut data2 = BUILD_INFO_SAMPLE.as_bytes().to_vec();
+            for (pos, xor) in &flips {
+                if !data2.is_empty() {
+                    let idx = pos % data2.len();
+                    data2[idx] ^= xor | 1;
+                }
+            }
+            let s2 = String::from_utf8_lossy(&data2).into_owned();
+            let _ = BuildInfo::parse(&s2);
+        }
+
+        /// Truncating otherwise-valid config/info files to an arbitrary
+        /// length should never panic.
+        #[test]
+        fn prop_no_panic_truncated(trunc_len in any::<usize>()) {
+            let data = BUILD_CONFIG_SAMPLE.as_bytes();
+            let len = trunc_len % (data.len() + 1);
+            let s = String::from_utf8_lossy(&data[..len]).into_owned();
+            let _ = BuildConfig::parse(&s);
+
+            let data2 = BUILD_INFO_SAMPLE.as_bytes();
+            let len2 = trunc_len % (data2.len() + 1);
+            let s2 = String::from_utf8_lossy(&data2[..len2]).into_owned();
+            let _ = BuildInfo::parse(&s2);
+        }
     }
 }
