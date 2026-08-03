@@ -35,7 +35,9 @@ pub trait ReadAt {
 impl ReadAt for [u8] {
     fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
         let start = usize::try_from(offset).ok().filter(|&o| o <= self.len());
-        let end = start.and_then(|s| s.checked_add(buf.len())).filter(|&e| e <= self.len());
+        let end = start
+            .and_then(|s| s.checked_add(buf.len()))
+            .filter(|&e| e <= self.len());
         match (start, end) {
             (Some(start), Some(end)) => {
                 buf.copy_from_slice(&self[start..end]);
@@ -110,7 +112,7 @@ mod fs_impl {
             while !buf.is_empty() {
                 match self.seek_read(buf, offset) {
                     Ok(0) => {
-                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
                     }
                     Ok(n) => {
                         buf = &mut buf[n..];

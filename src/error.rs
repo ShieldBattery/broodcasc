@@ -10,6 +10,10 @@ pub enum CascError {
     Malformed { what: &'static str, reason: String },
     #[error("file not found: {0}")]
     NotFound(String),
+    #[error("unsupported {what}: {reason}")]
+    Unsupported { what: &'static str, reason: String },
+    #[error("checksum mismatch in {0}")]
+    ChecksumMismatch(&'static str),
 }
 
 impl CascError {
