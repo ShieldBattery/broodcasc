@@ -238,7 +238,7 @@ fn parse_file(data: &[u8], out: &mut HashMap<TruncatedKey, IdxEntry>) -> Result<
     ) as usize;
     debug_assert_eq!(ENTRIES_GUARD_OFFSET + GUARD_HEADER_LEN, ENTRIES_OFFSET);
 
-    if entry_block_size % ENTRY_LEN != 0 {
+    if !entry_block_size.is_multiple_of(ENTRY_LEN) {
         return Err(CascError::malformed(
             "local index file",
             format!("entry block size {entry_block_size} is not a multiple of {ENTRY_LEN}"),

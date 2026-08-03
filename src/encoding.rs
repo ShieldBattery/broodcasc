@@ -202,13 +202,13 @@ fn parse_page(
             first = false;
         }
 
-        if let Some(last) = entries.last() {
-            if last.ckey >= ckey {
-                return Err(CascError::malformed(
-                    "encoding table",
-                    "CKeys are not strictly increasing",
-                ));
-            }
+        if let Some(last) = entries.last()
+            && last.ckey >= ckey
+        {
+            return Err(CascError::malformed(
+                "encoding table",
+                "CKeys are not strictly increasing",
+            ));
         }
 
         // Only the first EKey is kept; the rest (alternate encodings of the

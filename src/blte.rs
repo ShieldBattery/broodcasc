@@ -226,16 +226,16 @@ fn decode_chunk_inner(
 
     match mode {
         b'N' => {
-            if let Some(expected) = expected_size {
-                if payload.len() as u32 != expected {
-                    return Err(CascError::malformed(
-                        "BLTE chunk",
-                        format!(
-                            "mode 'N' payload length {} does not match declared decompressed_size {expected}",
-                            payload.len()
-                        ),
-                    ));
-                }
+            if let Some(expected) = expected_size
+                && payload.len() as u32 != expected
+            {
+                return Err(CascError::malformed(
+                    "BLTE chunk",
+                    format!(
+                        "mode 'N' payload length {} does not match declared decompressed_size {expected}",
+                        payload.len()
+                    ),
+                ));
             }
             Ok(payload.to_vec())
         }
@@ -244,16 +244,16 @@ fn decode_chunk_inner(
             let decoded = decompress_to_vec_zlib_with_limit(payload, limit).map_err(|e| {
                 CascError::malformed("BLTE chunk", format!("zlib inflate failed: {e:?}"))
             })?;
-            if let Some(expected) = expected_size {
-                if decoded.len() as u32 != expected {
-                    return Err(CascError::malformed(
-                        "BLTE chunk",
-                        format!(
-                            "mode 'Z' decompressed length {} does not match declared decompressed_size {expected}",
-                            decoded.len()
-                        ),
-                    ));
-                }
+            if let Some(expected) = expected_size
+                && decoded.len() as u32 != expected
+            {
+                return Err(CascError::malformed(
+                    "BLTE chunk",
+                    format!(
+                        "mode 'Z' decompressed length {} does not match declared decompressed_size {expected}",
+                        decoded.len()
+                    ),
+                ));
             }
             Ok(decoded)
         }
