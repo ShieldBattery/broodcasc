@@ -27,11 +27,24 @@ anything that wants to read files out of an SC:R install.
 use broodcasc::Storage;
 
 let storage = Storage::open(r"C:\Program Files (x86)\StarCraft")?;
-let bytes = storage.read_file("music\\terran1.ogg")?;
+
+// Lookups are case-insensitive and accept either separator.
+let chk = storage.read_file("SD/campaign/Starcraft/SWAR/staredit/scenario.chk")?;
+
 for name in storage.file_names() {
     println!("{name}");
 }
 ```
+
+Every read is verified end to end (BLTE chunk MD5s plus the whole-file
+content MD5). Note that a partial install catalogs files it never
+downloaded (e.g. other locales' audio) — those reads fail with
+`CascError::NotInstalled`, distinct from `NotFound`.
+
+On WASM (or anything without `std::fs`), build with
+`--no-default-features` and hand `Storage::open_with_provider` your own
+`StorageProvider` implementation — e.g. OPFS sync access handles in a
+worker, or in-memory buffers.
 
 ## Format documentation
 
