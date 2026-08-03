@@ -20,6 +20,11 @@ external docs; if reality disagrees with it, update it.
   `cargo fmt --check` — both must stay clean
 - `cargo build --target wasm32-unknown-unknown --no-default-features` — must
   keep building; CI checks it
+- `cargo +nightly fuzz run <target> fuzz/seeds/<target>` (from repo root;
+  targets: `blte_decode`, `encoding_parse`, `idx_parse`, `root_parse`,
+  `config_parse`) — fuzzing for the untrusted-input parsers; see the README's
+  "Fuzzing" section. Committed seeds under `fuzz/seeds/` are synthetic —
+  never add real game-install bytes there.
 
 ## Conventions
 

@@ -1,0 +1,67 @@
+[package]
+name = "broodcasc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+md-5 = "0.11"
+miniz_oxide = "0.9"
+
+[dependencies.broodcasc]
+path = ".."
+default-features = false
+
+[[bin]]
+name = "blte_decode"
+path = "fuzz_targets/blte_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "encoding_parse"
+path = "fuzz_targets/encoding_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "idx_parse"
+path = "fuzz_targets/idx_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "root_parse"
+path = "fuzz_targets/root_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "config_parse"
+path = "fuzz_targets/config_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "seed_gen"
+path = "seed_gen/main.rs"
+test = false
+doc = false
+bench = false
+
+[profile.release]
+debug = 1
+
+# Detached from the parent crate (which is a plain crate, not a workspace):
+# this is its own workspace root so `cargo fuzz` doesn't try to unify
+# dependency resolution with broodcasc's own Cargo.lock.
+[workspace]

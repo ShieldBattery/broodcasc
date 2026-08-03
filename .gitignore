@@ -1,2 +1,10 @@
 /target
 .idea
+
+# Local-only fuzzing artifacts: real-data corpus enrichment (see
+# examples/extract_fuzz_corpus.rs), crash reproductions, and the fuzz
+# crate's own build output. The committed seeds live in fuzz/seeds/, which
+# is NOT covered by this.
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/target/

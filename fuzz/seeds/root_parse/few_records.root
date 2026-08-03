@@ -1,0 +1,4 @@
+synthetic/seed/fileA.txt|00000000000000000000000000000001
+synthetic/seed/nested/dir/fileB.bin|00000000000000000000000000000002
+synthetic/seed/FileWithMixedCase.DAT|00000000000000000000000000000003
+synthetic/seed/empty.chk|d41d8cd98f00b204e9800998ecf8427e
