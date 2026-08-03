@@ -40,11 +40,21 @@ impl BuildInfo {
     /// (`None`) rather than an empty string. Trailing empty lines and CRLF
     /// line endings are tolerated.
     ///
+    /// Lines whose trimmed form starts with `#` are skipped entirely,
+    /// wherever they appear — before the header or between records.
+    /// `.build.info` itself never contains these, but the same pipe-delimited
+    /// table format is also used by NGDP's `versions`/`cdns` HTTP responses,
+    /// which intersperse `## seqn = <n>` comment lines; skipping them here
+    /// lets this same parser handle those responses directly.
+    ///
     /// Fails on empty input, a header column missing the `!` type
     /// separator, or a record with more fields than the header has columns
     /// (fewer fields is fine — the missing trailing fields become `None`).
     pub fn parse(text: &str) -> Result<BuildInfo> {
-        let mut lines = text.lines().filter(|line| !line.trim().is_empty());
+        let mut lines = text.lines().filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with('#')
+        });
 
         let header = lines
             .next()
@@ -364,6 +374,14 @@ build-playbuild-installer = ngdptool_casc2
     }
 
     #[test]
+    fn build_info_skips_seqn_comment_line() {
+        let text = "Branch!STRING:0|Active!DEC:1\n## seqn = 11111\nus|1\n";
+        let info = assert_ok!(BuildInfo::parse(text));
+        assert_eq!(info.records().len(), 1);
+        assert_eq!(info.records()[0].branch(), Some("us"));
+    }
+
+    #[test]
     fn build_info_rejects_empty_input() {
         assert!(BuildInfo::parse("").is_err());
         assert!(BuildInfo::parse("\n\n\r\n").is_err());
@@ -507,7 +525,12 @@ build-playbuild-installer = ngdptool_casc2
     }
 
     /// Printable ASCII excluding `|` (the field separator) and newlines
-    /// (already excluded by the printable range).
+    /// (already excluded by the printable range). Excludes values starting
+    /// with `#`: if such a value lands in a record's first column, the
+    /// serialized line itself would start with `#` and `BuildInfo::parse`
+    /// would (correctly) skip it as a comment line, which would break the
+    /// roundtrip below — not a bug in the parser, just untestable input for
+    /// this particular strategy.
     fn info_value() -> impl Strategy<Value = String> {
         proptest::collection::vec(
             (0x20u8..=0x7eu8)
@@ -515,7 +538,8 @@ build-playbuild-installer = ngdptool_casc2
                 .prop_map(|b| b as char),
             1..12,
         )
-        .prop_map(|cs| cs.into_iter().collect())
+        .prop_map(|cs| cs.into_iter().collect::<String>())
+        .prop_filter("not a comment", |v: &String| !v.starts_with('#'))
     }
 
     /// At least 2 unique column names, so a serialized record line always
