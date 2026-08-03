@@ -17,6 +17,11 @@ pub enum CascError {
     NotInstalled(String),
     #[error("unsupported {what}: {reason}")]
     Unsupported { what: &'static str, reason: String },
+    /// A CDN transport failure that isn't a clean "resource doesn't exist"
+    /// (those surface as [`CascError::NotFound`]): connection failures,
+    /// unexpected HTTP statuses, servers ignoring Range requests, ...
+    #[error("transport error for {url}: {reason}")]
+    Transport { url: String, reason: String },
     #[error("checksum mismatch in {0}")]
     ChecksumMismatch(&'static str),
 }

@@ -10,14 +10,21 @@ keywords = ["casc", "starcraft", "blizzard", "archive"]
 categories = ["parser-implementations", "game-development"]
 
 [features]
-default = ["fs"]
+default = ["fs", "cdn"]
 # Local filesystem storage backend (not available on wasm32-unknown-unknown)
 fs = []
+# CDN ("online") storage core: discovery/index parsing and CdnStorage over a
+# pluggable transport. No HTTP dependency; works on WASM with a custom
+# transport.
+cdn = []
+# Batteries-included native HTTP transport for `cdn`, using ureq.
+cdn-http = ["cdn", "dep:ureq"]
 
 [dependencies]
 md-5 = "0.11"
 miniz_oxide = "0.9"
 thiserror = "2.0"
+ureq = { version = "3.3", optional = true }
 
 [dev-dependencies]
 assert_ok = "1.0"

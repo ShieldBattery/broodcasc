@@ -15,6 +15,10 @@
 //! on-disk format this implementation follows.
 
 pub mod blte;
+#[cfg(feature = "cdn")]
+pub mod cdn;
+#[cfg(feature = "cdn")]
+pub mod cdnindex;
 pub mod config;
 pub mod encoding;
 pub mod error;
@@ -23,7 +27,11 @@ pub mod io;
 pub mod keys;
 pub mod root;
 pub mod storage;
+#[cfg(feature = "cdn")]
+pub mod tact;
 
+#[cfg(feature = "cdn")]
+pub use cdn::CdnStorage;
 pub use error::CascError;
 pub use keys::{ContentKey, EncodingKey, TruncatedKey};
 pub use storage::Storage;

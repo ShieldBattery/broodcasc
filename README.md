@@ -46,6 +46,28 @@ On WASM (or anything without `std::fs`), build with
 `StorageProvider` implementation — e.g. OPFS sync access handles in a
 worker, or in-memory buffers.
 
+## CDN ("online") storage
+
+Files can also be read straight from Blizzard's CDN, no install required —
+handy for e.g. rendering tileset images on a server or in a browser:
+
+```rust,ignore
+use broodcasc::cdn::{CachingTransport, CdnStorage, HttpTransport};
+
+let transport = CachingTransport::new(HttpTransport::new(), "./cdn-cache");
+let storage = CdnStorage::open("s1", "us", transport)?;
+let bytes = storage.read_file("SD/campaign/Starcraft/SWAR/staredit/scenario.chk")?;
+```
+
+`CdnStorage::open` discovers the current live build; `open_pinned` takes
+explicit build/CDN config hashes to pin a specific build instead. All
+fetching goes through the `CdnTransport` trait: the `cdn-http` feature
+provides the ureq-based `HttpTransport` for native use, while WASM builds
+(`--no-default-features --features cdn`) supply their own transport over
+`fetch`/XHR. `CachingTransport` (with the `fs` feature) persists
+content-addressed downloads to disk, making reopening cheap. Reads are
+verified the same way as local storage (BLTE chunk MD5s + whole-file CKey).
+
 ## Fuzzing
 
 `fuzz/` holds `cargo-fuzz` targets for the five parsers that touch untrusted
