@@ -715,6 +715,13 @@ CDN config (`bd4a0f87…`, key `archives = …`). Footer layout (`FILE_INDEX_FOO
 this version)**. **Not needed for local reading** — they map EKey → (CDN archive, offset), which is
 only useful when streaming from Blizzard's CDN. Skip the whole directory.
 
+> **Width variation (verified across all 53 files):** only 45 of the `.index` files use the
+> 4/4/16 widths above — the ones named by the CDN config's `archives` list (per-archive indices).
+> 4 files use `OffsetBytes = 0` (a *file index*: loose-file EKeys + sizes, no offsets) and 4 use
+> `OffsetBytes = 5` (an *archive group* index: merged across archives, with the archive number
+> packed into the offset's high bits, like local `.idx` StorageOffsets). A reader of per-archive
+> indices must validate the footer widths rather than assume them.
+
 **`Data\data\shmem`** — 11 280 bytes; begins `04 00 00 00 | 50 01 00 00 | "Global\C:/Program Files
 (x86)/StarCraft/Data/data\0…"`. It is the writer's free-space/allocation bookkeeping and the
 "current .idx version per bucket" record. **Ignorable for read-only.** (If you wanted to be
