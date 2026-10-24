@@ -93,7 +93,10 @@ out-of-band channel whenever the selected build must be a trust anchor. All
 fetching goes through the `CdnTransport` trait: the `cdn-http` feature
 provides the ureq-based `HttpTransport` for native use, while WASM builds
 (`--no-default-features --features cdn`) supply their own transport over
-`fetch`/XHR. `CachingTransport` (with the `fs` feature) persists
+`fetch`/XHR. Opening takes 4 sequential round trips because independent
+requests go through `CdnTransport::get_many` (as does `CdnStorage::read_files`);
+the provided implementation is sequential on `wasm32`, so a browser transport
+should override it to issue the fetches concurrently. `CachingTransport` (with the `fs` feature) persists
 content-addressed downloads to disk, making reopening cheap.
 The cache has per-entry safety bounds and repairs rejected entries, but it does
 not impose a total disk quota; applications should manage the cache directory's
