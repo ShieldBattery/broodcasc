@@ -44,7 +44,7 @@
 //! and §3.3 for the full (empirically verified) spec this module follows,
 //! including known discrepancies with published CascLib header comments.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
 
 use crate::error::{CascError, Result};
 use crate::jenkins::{hashlittle, hashlittle2};
@@ -62,6 +62,12 @@ const SEGMENT_BITS_RANGE: std::ops::RangeInclusive<u8> = 16..=39;
 /// not a supported storage and would otherwise amplify a bounded `.idx`
 /// buffer into an unbounded hash-table allocation.
 const MAX_INDEX_ENTRIES: usize = 1_000_000;
+const DIR_BITS: u32 = 12;
+const DIR_SLOTS: usize = 1 << DIR_BITS;
+
+fn dir_slot(key: &TruncatedKey) -> usize {
+    (usize::from(key.0[0]) << (DIR_BITS - 8)) | usize::from(key.0[1] >> (16 - DIR_BITS))
+}
 
 fn entry_block_hash(entries: &[u8]) -> u32 {
     let mut hi = 0;
@@ -89,7 +95,15 @@ pub struct IdxEntry {
 /// [`LocalIndex::select_files`] first to decide which files to read off disk.
 #[derive(Debug, Clone, Default)]
 pub struct LocalIndex {
-    entries: HashMap<TruncatedKey, IdxEntry>,
+    /// Sorted, strictly increasing keys; `entries[i]` belongs to `keys[i]`.
+    /// Split from the values so binary search touches only 9-byte keys.
+    keys: Vec<TruncatedKey>,
+    entries: Vec<IdxEntry>,
+    /// `dir[p]..dir[p + 1]` is the range of `keys` whose top `DIR_BITS` bits
+    /// equal `p`. Real keys are uniformly random, so each range is a handful
+    /// of entries; arbitrary keys only degrade to a plain binary search.
+    /// Empty while the index is.
+    dir: Vec<u32>,
 }
 
 impl LocalIndex {
@@ -147,17 +161,74 @@ impl LocalIndex {
     /// from the later file wins. Real storages never have duplicate keys
     /// across buckets, so this only matters for malformed input.
     pub fn from_files<'a>(files: impl IntoIterator<Item = &'a [u8]>) -> Result<LocalIndex> {
-        let mut entries = HashMap::new();
+        let mut index = LocalIndex::default();
         for data in files {
-            parse_file(data, &mut entries)?;
+            index.add_file(data)?;
         }
-        Ok(LocalIndex { entries })
+        Ok(index)
     }
 
     /// Parses one additional selected bucket file. Storage bootstrap uses
     /// this to release each raw `.idx` buffer before reading the next one.
     pub(crate) fn add_file(&mut self, data: &[u8]) -> Result<()> {
-        parse_file(data, &mut self.entries)
+        let run = parse_file(data, self.keys.len())?;
+        self.merge_run(&run)
+    }
+
+    /// Merges a key-sorted, duplicate-free `run` into the index. On a key
+    /// present in both, the run's entry wins.
+    fn merge_run(&mut self, run: &[(TruncatedKey, IdxEntry)]) -> Result<()> {
+        if run.is_empty() {
+            return Ok(());
+        }
+        let cap = self.keys.len() + run.len();
+        let oom = |_| CascError::LimitExceeded {
+            what: "local index entries",
+            limit: MAX_INDEX_ENTRIES,
+        };
+        let mut keys = Vec::new();
+        let mut entries = Vec::new();
+        keys.try_reserve_exact(cap).map_err(oom)?;
+        entries.try_reserve_exact(cap).map_err(oom)?;
+
+        let (mut i, mut j) = (0, 0);
+        while i < self.keys.len() && j < run.len() {
+            match self.keys[i].cmp(&run[j].0) {
+                Ordering::Less => {
+                    keys.push(self.keys[i]);
+                    entries.push(self.entries[i]);
+                    i += 1;
+                }
+                Ordering::Greater => {
+                    keys.push(run[j].0);
+                    entries.push(run[j].1);
+                    j += 1;
+                }
+                Ordering::Equal => {
+                    keys.push(run[j].0);
+                    entries.push(run[j].1);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+        keys.extend_from_slice(&self.keys[i..]);
+        entries.extend_from_slice(&self.entries[i..]);
+        for (k, e) in &run[j..] {
+            keys.push(*k);
+            entries.push(*e);
+        }
+        let mut dir = vec![0u32; DIR_SLOTS + 1];
+        for key in &keys {
+            dir[dir_slot(key) + 1] += 1;
+        }
+        for i in 0..DIR_SLOTS {
+            dir[i + 1] += dir[i];
+        }
+        self.keys = keys;
+        self.entries = entries;
+        self.dir = dir;
+        Ok(())
     }
 
     /// Looks up a full encoding key, truncating it to 9 bytes internally (as
@@ -168,7 +239,11 @@ impl LocalIndex {
 
     /// Looks up an already-truncated (9-byte) key.
     pub fn lookup_truncated(&self, key: &TruncatedKey) -> Option<&IdxEntry> {
-        self.entries.get(key)
+        let slot = dir_slot(key);
+        let lo = *self.dir.get(slot)? as usize;
+        let hi = *self.dir.get(slot + 1)? as usize;
+        let i = lo + self.keys.get(lo..hi)?.binary_search(key).ok()?;
+        self.entries.get(i)
     }
 
     /// Number of entries in the merged index.
@@ -181,16 +256,18 @@ impl LocalIndex {
         self.entries.is_empty()
     }
 
-    /// Iterates over all entries in the merged index, in arbitrary order.
+    /// Iterates over all entries in the merged index, in ascending key order.
     pub fn entries(&self) -> impl Iterator<Item = (&TruncatedKey, &IdxEntry)> {
-        self.entries.iter()
+        self.keys.iter().zip(self.entries.iter())
     }
 }
 
-/// Parses one `.idx` file's entries into `out`, skipping placeholder spans
-/// (`EncodedSize <= 30`). On a key collision within or across calls, the
-/// later entry wins.
-fn parse_file(data: &[u8], out: &mut HashMap<TruncatedKey, IdxEntry>) -> Result<()> {
+/// Parses one `.idx` file into a key-sorted run, skipping placeholder spans
+/// (`EncodedSize <= 30`). On a key collision within the file, the later
+/// entry wins. `existing` is the number of entries already indexed, for the
+/// total-size limit. Real files are already sorted; unsorted input is
+/// sorted here.
+fn parse_file(data: &[u8], existing: usize) -> Result<Vec<(TruncatedKey, IdxEntry)>> {
     if data.len() < ENTRIES_OFFSET {
         return Err(CascError::malformed(
             "local index file",
@@ -297,13 +374,14 @@ fn parse_file(data: &[u8], out: &mut HashMap<TruncatedKey, IdxEntry>) -> Result<
     }
 
     let entry_count = entry_block_size / ENTRY_LEN;
-    if out.len().saturating_add(entry_count) > MAX_INDEX_ENTRIES {
+    if existing.saturating_add(entry_count) > MAX_INDEX_ENTRIES {
         return Err(CascError::LimitExceeded {
             what: "local index entries",
             limit: MAX_INDEX_ENTRIES,
         });
     }
-    out.try_reserve(entry_count)
+    let mut out = Vec::new();
+    out.try_reserve_exact(entry_count)
         .map_err(|_| CascError::LimitExceeded {
             what: "local index entries",
             limit: MAX_INDEX_ENTRIES,
@@ -333,17 +411,31 @@ fn parse_file(data: &[u8], out: &mut HashMap<TruncatedKey, IdxEntry>) -> Result<
         })?;
         let offset = storage_offset & offset_mask;
 
-        out.insert(
+        out.push((
             TruncatedKey(key9),
             IdxEntry {
                 archive,
                 offset,
                 encoded_size,
             },
-        );
+        ));
     }
 
-    Ok(())
+    if !out.is_sorted_by_key(|(k, _)| *k) {
+        // Stable, so equal keys stay in file order for the dedup below.
+        out.sort_by_key(|(k, _)| *k);
+    }
+    // Keep the last of each run of equal keys (later entry wins).
+    let mut w = 0;
+    for r in 0..out.len() {
+        if r + 1 < out.len() && out[r].0 == out[r + 1].0 {
+            continue;
+        }
+        out[w] = out[r];
+        w += 1;
+    }
+    out.truncate(w);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -628,6 +720,28 @@ mod tests {
         assert_eq!(entry.archive, 2);
         assert_eq!(entry.offset, 20);
         assert_eq!(entry.encoded_size, 200);
+    }
+
+    #[test]
+    fn unsorted_file_with_internal_duplicates_is_normalized() {
+        let (a, b, c) = (key9(0x10), key9(0x50), key9(0x90));
+        let off = |n| pack_storage_offset(0, n, 30);
+        let first = build_idx_file(
+            30,
+            &[
+                (c, off(1), 100),
+                (a, off(2), 100),
+                (c, off(3), 100),
+                (b, off(4), 100),
+                (a, off(5), 100),
+            ],
+        );
+        let second = build_idx_file(30, &[(b, off(6), 100), (key9(0x70), off(7), 100)]);
+        let index = LocalIndex::from_files([first.as_slice(), second.as_slice()]).unwrap();
+        let got: Vec<_> = index.entries().map(|(k, e)| (k.0[0], e.offset)).collect();
+        assert_eq!(got, [(0x10, 5), (0x50, 6), (0x70, 7), (0x90, 3)]);
+        assert_eq!(index.len(), 4);
+        assert!(index.lookup_truncated(&TruncatedKey(key9(0x11))).is_none());
     }
 
     #[test]
