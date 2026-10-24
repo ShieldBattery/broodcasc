@@ -312,15 +312,13 @@ impl<P: StorageProvider> Storage<P> {
                 "no .idx files found under Data/data",
             ));
         }
-        let mut index = LocalIndex::default();
-        for name in &idx_names {
-            let bytes = read_metadata(
+        let index = LocalIndex::try_from_files(idx_names.iter().map(|name| {
+            read_metadata(
                 &provider,
                 &format!("Data/data/{name}"),
                 options.max_metadata_bytes,
-            )?;
-            index.add_file(&bytes)?;
-        }
+            )
+        }))?;
 
         let mut spans = SpanReader {
             provider,

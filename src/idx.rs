@@ -44,8 +44,6 @@
 //! and §3.3 for the full (empirically verified) spec this module follows,
 //! including known discrepancies with published CascLib header comments.
 
-use std::cmp::Ordering;
-
 use crate::error::{CascError, Result};
 use crate::jenkins::{hashlittle, hashlittle2};
 use crate::keys::{EncodingKey, TruncatedKey};
@@ -161,74 +159,75 @@ impl LocalIndex {
     /// from the later file wins. Real storages never have duplicate keys
     /// across buckets, so this only matters for malformed input.
     pub fn from_files<'a>(files: impl IntoIterator<Item = &'a [u8]>) -> Result<LocalIndex> {
-        let mut index = LocalIndex::default();
-        for data in files {
-            index.add_file(data)?;
-        }
-        Ok(index)
+        Self::try_from_files(files.into_iter().map(Ok))
     }
 
-    /// Parses one additional selected bucket file. Storage bootstrap uses
-    /// this to release each raw `.idx` buffer before reading the next one.
-    pub(crate) fn add_file(&mut self, data: &[u8]) -> Result<()> {
-        let run = parse_file(data, self.keys.len())?;
-        self.merge_run(&run)
-    }
-
-    /// Merges a key-sorted, duplicate-free `run` into the index. On a key
-    /// present in both, the run's entry wins.
-    fn merge_run(&mut self, run: &[(TruncatedKey, IdxEntry)]) -> Result<()> {
-        if run.is_empty() {
-            return Ok(());
-        }
-        let cap = self.keys.len() + run.len();
-        let oom = |_| CascError::LimitExceeded {
-            what: "local index entries",
-            limit: MAX_INDEX_ENTRIES,
-        };
-        let mut keys = Vec::new();
-        let mut entries = Vec::new();
-        keys.try_reserve_exact(cap).map_err(oom)?;
-        entries.try_reserve_exact(cap).map_err(oom)?;
-
-        let (mut i, mut j) = (0, 0);
-        while i < self.keys.len() && j < run.len() {
-            match self.keys[i].cmp(&run[j].0) {
-                Ordering::Less => {
-                    keys.push(self.keys[i]);
-                    entries.push(self.entries[i]);
-                    i += 1;
-                }
-                Ordering::Greater => {
-                    keys.push(run[j].0);
-                    entries.push(run[j].1);
-                    j += 1;
-                }
-                Ordering::Equal => {
-                    keys.push(run[j].0);
-                    entries.push(run[j].1);
-                    i += 1;
-                    j += 1;
-                }
+    /// Like [`LocalIndex::from_files`], but pulls each file lazily so the
+    /// caller can release one raw `.idx` buffer before reading the next.
+    pub(crate) fn try_from_files<B: AsRef<[u8]>>(
+        files: impl IntoIterator<Item = Result<B>>,
+    ) -> Result<LocalIndex> {
+        let mut all = Vec::new();
+        let mut files = files.into_iter();
+        let mut first = true;
+        while let Some(data) = files.next() {
+            parse_file(data?.as_ref(), &mut all)?;
+            if first {
+                first = false;
+                // Bucket files are near-equal in size: size the buffer for
+                // the remaining files up front instead of regrowing it.
+                let guess = all.len().saturating_mul(files.size_hint().0);
+                let guess = guess.min(MAX_INDEX_ENTRIES.saturating_sub(all.len()));
+                // Best effort; `parse_file` reports real allocation failure.
+                let _ = all.try_reserve(guess);
             }
         }
-        keys.extend_from_slice(&self.keys[i..]);
-        entries.extend_from_slice(&self.entries[i..]);
-        for (k, e) in &run[j..] {
-            keys.push(*k);
-            entries.push(*e);
+        // Keys are uniformly random, so a stable counting sort on the
+        // directory prefix leaves only tiny groups to sort. Stability keeps
+        // equal keys in file order for the dedup below.
+        let mut dir = build_dir(all.iter().map(|(k, _)| k));
+        let filler = IdxEntry {
+            archive: 0,
+            offset: 0,
+            encoded_size: 0,
+        };
+        let mut keys: Vec<TruncatedKey> = Vec::new();
+        let mut entries: Vec<IdxEntry> = Vec::new();
+        keys.try_reserve_exact(all.len()).map_err(oom)?;
+        entries.try_reserve_exact(all.len()).map_err(oom)?;
+        keys.resize(all.len(), TruncatedKey([0; 9]));
+        entries.resize(all.len(), filler);
+        let mut next = dir.clone();
+        for &(key, entry) in &all {
+            let n = &mut next[dir_slot(&key)];
+            keys[*n as usize] = key;
+            entries[*n as usize] = entry;
+            *n += 1;
         }
-        let mut dir = vec![0u32; DIR_SLOTS + 1];
-        for key in &keys {
-            dir[dir_slot(key) + 1] += 1;
+        drop(all);
+        for w in dir.windows(2) {
+            sort_group(
+                &mut keys[w[0] as usize..w[1] as usize],
+                &mut entries[w[0] as usize..w[1] as usize],
+            );
         }
-        for i in 0..DIR_SLOTS {
-            dir[i + 1] += dir[i];
+
+        // Keep the last of each run of equal keys (later entry wins).
+        let mut w = 0;
+        for r in 0..keys.len() {
+            if keys.get(r + 1) == Some(&keys[r]) {
+                continue;
+            }
+            keys[w] = keys[r];
+            entries[w] = entries[r];
+            w += 1;
         }
-        self.keys = keys;
-        self.entries = entries;
-        self.dir = dir;
-        Ok(())
+        if w != keys.len() {
+            keys.truncate(w);
+            entries.truncate(w);
+            dir = build_dir(keys.iter());
+        }
+        Ok(LocalIndex { keys, entries, dir })
     }
 
     /// Looks up a full encoding key, truncating it to 9 bytes internally (as
@@ -262,12 +261,52 @@ impl LocalIndex {
     }
 }
 
-/// Parses one `.idx` file into a key-sorted run, skipping placeholder spans
-/// (`EncodedSize <= 30`). On a key collision within the file, the later
-/// entry wins. `existing` is the number of entries already indexed, for the
-/// total-size limit. Real files are already sorted; unsorted input is
-/// sorted here.
-fn parse_file(data: &[u8], existing: usize) -> Result<Vec<(TruncatedKey, IdxEntry)>> {
+fn build_dir<'a>(keys: impl Iterator<Item = &'a TruncatedKey>) -> Vec<u32> {
+    let mut dir = vec![0u32; DIR_SLOTS + 1];
+    for key in keys {
+        dir[dir_slot(key) + 1] += 1;
+    }
+    for i in 0..DIR_SLOTS {
+        dir[i + 1] += dir[i];
+    }
+    dir
+}
+
+/// Stable sort of parallel `keys`/`entries` slices by key.
+fn sort_group(keys: &mut [TruncatedKey], entries: &mut [IdxEntry]) {
+    if keys.is_sorted() {
+        return;
+    }
+    if keys.len() <= 32 {
+        for i in 1..keys.len() {
+            let mut j = i;
+            while j > 0 && keys[j - 1] > keys[j] {
+                keys.swap(j - 1, j);
+                entries.swap(j - 1, j);
+                j -= 1;
+            }
+        }
+        return;
+    }
+    let mut pairs: Vec<_> = keys.iter().copied().zip(entries.iter().copied()).collect();
+    pairs.sort_by_key(|(k, _)| *k);
+    for (i, (k, e)) in pairs.into_iter().enumerate() {
+        keys[i] = k;
+        entries[i] = e;
+    }
+}
+
+fn oom<E>(_: E) -> CascError {
+    CascError::LimitExceeded {
+        what: "local index entries",
+        limit: MAX_INDEX_ENTRIES,
+    }
+}
+
+/// Parses one `.idx` file, appending its entries to `out` and skipping
+/// placeholder spans (`EncodedSize <= 30`). Order is preserved; the caller
+/// sorts and resolves duplicates.
+fn parse_file(data: &[u8], out: &mut Vec<(TruncatedKey, IdxEntry)>) -> Result<()> {
     if data.len() < ENTRIES_OFFSET {
         return Err(CascError::malformed(
             "local index file",
@@ -374,18 +413,13 @@ fn parse_file(data: &[u8], existing: usize) -> Result<Vec<(TruncatedKey, IdxEntr
     }
 
     let entry_count = entry_block_size / ENTRY_LEN;
-    if existing.saturating_add(entry_count) > MAX_INDEX_ENTRIES {
+    if out.len().saturating_add(entry_count) > MAX_INDEX_ENTRIES {
         return Err(CascError::LimitExceeded {
             what: "local index entries",
             limit: MAX_INDEX_ENTRIES,
         });
     }
-    let mut out = Vec::new();
-    out.try_reserve_exact(entry_count)
-        .map_err(|_| CascError::LimitExceeded {
-            what: "local index entries",
-            limit: MAX_INDEX_ENTRIES,
-        })?;
+    out.try_reserve(entry_count).map_err(oom)?;
 
     for entry in entry_bytes.as_chunks::<ENTRY_LEN>().0 {
         let mut key9 = [0u8; 9];
@@ -421,21 +455,7 @@ fn parse_file(data: &[u8], existing: usize) -> Result<Vec<(TruncatedKey, IdxEntr
         ));
     }
 
-    if !out.is_sorted_by_key(|(k, _)| *k) {
-        // Stable, so equal keys stay in file order for the dedup below.
-        out.sort_by_key(|(k, _)| *k);
-    }
-    // Keep the last of each run of equal keys (later entry wins).
-    let mut w = 0;
-    for r in 0..out.len() {
-        if r + 1 < out.len() && out[r].0 == out[r + 1].0 {
-            continue;
-        }
-        out[w] = out[r];
-        w += 1;
-    }
-    out.truncate(w);
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
