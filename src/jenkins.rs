@@ -31,15 +31,13 @@ pub(crate) fn hashlittle2(mut data: &[u8], pc: u32, pb: u32) -> (u32, u32) {
         return (c, b);
     }
 
-    for (index, &byte) in data.iter().enumerate() {
-        let value = u32::from(byte) << ((index % 4) * 8);
-        match index / 4 {
-            0 => a = a.wrapping_add(value),
-            1 => b = b.wrapping_add(value),
-            2 => c = c.wrapping_add(value),
-            _ => unreachable!("hashlittle tail is at most 12 bytes"),
-        }
-    }
+    // Zero-padding the tail to 12 bytes adds the same words as the
+    // byte-at-a-time reference (absent bytes contribute nothing).
+    let mut tail = [0u8; 12];
+    tail[..data.len()].copy_from_slice(data);
+    a = a.wrapping_add(u32::from_le_bytes(tail[0..4].try_into().unwrap()));
+    b = b.wrapping_add(u32::from_le_bytes(tail[4..8].try_into().unwrap()));
+    c = c.wrapping_add(u32::from_le_bytes(tail[8..12].try_into().unwrap()));
     final_mix(&mut a, &mut b, &mut c);
     (c, b)
 }
