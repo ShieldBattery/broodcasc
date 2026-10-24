@@ -37,14 +37,14 @@ fn opens_and_reads_from_live_cdn() {
     // internally, so success == end-to-end correctness.
     let mut read = 0;
     for entry in storage.root().entries() {
-        let Ok(size) = storage.file_size(&entry.path) else {
+        let Ok(size) = storage.file_size(entry.path) else {
             continue;
         };
         if size == 0 || size > 200_000 {
             continue;
         }
         let bytes = storage
-            .read_file(&entry.path)
+            .read_file(entry.path)
             .unwrap_or_else(|e| panic!("reading {} failed: {e}", entry.path));
         assert_eq!(bytes.len() as u64, size, "size mismatch for {}", entry.path);
         read += 1;

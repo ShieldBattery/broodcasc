@@ -105,8 +105,12 @@ impl RootFile {
 
         // Upper bound on record count, so nothing regrows or rehashes.
         let max_records = data.iter().filter(|&&b| b == b'\n').count() + 1;
-        // Paths are a subset of the input, so its length bounds the arena.
-        let mut arena = String::with_capacity(data.len());
+        // Every valid record spends >= 34 bytes (hash, `|`, newline) on
+        // non-path text; this is only a capacity guess, the String still grows.
+        let mut arena = String::with_capacity(
+            data.len()
+                .saturating_sub(max_records.saturating_sub(1).saturating_mul(34)),
+        );
         let mut offsets: Vec<u32> = Vec::with_capacity(max_records + 1);
         offsets.push(0);
         let mut ckeys: Vec<ContentKey> = Vec::with_capacity(max_records);
@@ -200,33 +204,61 @@ fn span<'a>(arena: &'a str, offsets: &[u32], id: u32) -> &'a str {
     }
 }
 
-/// Folds one path byte: ASCII-lowercase, `\` → `/`. Non-ASCII UTF-8 bytes
-/// pass through, which matches per-char `to_ascii_lowercase`.
+const LO7: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+const HI: u64 = 0x8080_8080_8080_8080;
+const ONES: u64 = 0x0101_0101_0101_0101;
+
+/// Folds eight path bytes at once: ASCII-lowercase and `\` -> `/`. Bytes
+/// with the high bit set (UTF-8 multibyte sequences) pass through unchanged,
+/// matching per-char `to_ascii_lowercase`.
 #[inline]
-fn fold(b: u8) -> u8 {
-    if b == b'\\' {
-        b'/'
-    } else {
-        b.to_ascii_lowercase()
-    }
+fn fold_word(w: u64) -> u64 {
+    // Bytes in b'A'..=b'Z' (ASCII only) get 0x20 set.
+    let heptets = w & LO7;
+    let ge_a = heptets + (0x80 - u64::from(b'A')) * ONES;
+    let gt_z = heptets + (0x7f - u64::from(b'Z')) * ONES;
+    let upper = !w & (ge_a ^ gt_z) & HI;
+    let w = w | (upper >> 2);
+    // Exact zero-byte detection on `w ^ '\\'`, then flip 0x5c to 0x2f.
+    let x = w ^ (u64::from(b'\\') * ONES);
+    let zero = !(((x & LO7) + LO7) | x | LO7);
+    w ^ ((zero >> 7) * u64::from(b'\\' ^ b'/'))
 }
 
-/// Case/separator-insensitive hash of a path (FxHash-style byte mixing).
+/// Folded little-endian words of `path`; the final partial word is
+/// zero-padded (folding preserves zero).
+#[inline]
+fn folded_words(path: &str) -> impl Iterator<Item = u64> + '_ {
+    let (chunks, rem) = path.as_bytes().as_chunks::<8>();
+    let tail = (!rem.is_empty()).then(|| {
+        let mut buf = [0u8; 8];
+        buf[..rem.len()].copy_from_slice(rem);
+        buf
+    });
+    chunks
+        .iter()
+        .copied()
+        .chain(tail)
+        .map(|buf| fold_word(u64::from_le_bytes(buf)))
+}
+
+/// Case/separator-insensitive hash of a path (FxHash-style word mixing with
+/// a final avalanche so both the low index bits and high tag bits are good).
 #[inline]
 fn hash_path(path: &str) -> u64 {
     const K: u64 = 0x517c_c1b7_2722_0a95;
-    let mut h: u64 = 0;
-    for &b in path.as_bytes() {
-        h = (h.rotate_left(5) ^ u64::from(fold(b))).wrapping_mul(K);
+    let mut h = path.len() as u64;
+    for w in folded_words(path) {
+        h = (h.rotate_left(5) ^ w).wrapping_mul(K);
     }
-    // Spread entropy into the low bits used for the table index and the
-    // high bits used for the tag.
+    h ^= h >> 32;
+    h = h.wrapping_mul(0x9e37_79b9_7f4a_7c15);
     h ^ (h >> 29)
 }
 
 #[inline]
 fn paths_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| fold(x) == fold(y))
+    a.len() == b.len() && folded_words(a).eq(folded_words(b))
 }
 
 #[cfg(test)]
@@ -257,7 +289,7 @@ mod tests {
         let root = assert_ok!(RootFile::parse(SAMPLE.as_bytes()));
         assert_eq!(root.len(), 3);
         assert_eq!(
-            root.entries().nth(0).unwrap().path,
+            root.entries().next().unwrap().path,
             "locales/enUS/Assets/campaign/EXPZerg/Zerg08/staredit/wav/zovtra01.ogg"
         );
         assert_eq!(
@@ -288,7 +320,7 @@ mod tests {
             good/file.wav|316b0274bf2dabaa8db60c3ff1270c85\n";
         let root = assert_ok!(RootFile::parse(text.as_bytes()));
         assert_eq!(root.len(), 1);
-        assert_eq!(root.entries().nth(0).unwrap().path, "good/file.wav");
+        assert_eq!(root.entries().next().unwrap().path, "good/file.wav");
     }
 
     #[test]
@@ -349,8 +381,47 @@ mod tests {
             .prop_filter("need at least one entry after dedup", |v| !v.is_empty())
     }
 
+    fn fold_byte(b: u8) -> u8 {
+        if b == b'\\' {
+            b'/'
+        } else {
+            b.to_ascii_lowercase()
+        }
+    }
+
+    #[test]
+    fn non_ascii_paths_look_up_and_collide_correctly() {
+        let text = "Ünï/Cödé.wav|316b0274bf2dabaa8db60c3ff1270c85\n\
+                    ÜNÏ/cödé.wav|6637ed776bd22089e083b8b0b2c0374c\n";
+        // Only ASCII is case-folded, so these are distinct paths.
+        let root = assert_ok!(RootFile::parse(text.as_bytes()));
+        assert_eq!(root.len(), 2);
+        assert_eq!(root.lookup(r"Ünï\CÖDÉ.wav").map(|e| e.path), None);
+        assert!(root.lookup(r"Ünï\Cödé.WAV").is_some());
+        assert!(root.lookup(r"Ünï\cödé.wav").is_some());
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// The word-at-a-time fold must agree with the scalar fold per byte.
+        #[test]
+        fn prop_fold_word_matches_scalar(w in any::<u64>()) {
+            let got = fold_word(w).to_le_bytes();
+            for (g, b) in got.iter().zip(w.to_le_bytes()) {
+                prop_assert_eq!(*g, fold_byte(b));
+            }
+        }
+
+        /// Hash and equality see through case/separator differences, and
+        /// equality agrees with comparing normalized strings.
+        #[test]
+        fn prop_hash_and_eq_match_normalization(a in "[A-Za-z/\\\\.é]{0,40}", b in "[A-Za-z/\\\\.é]{0,40}") {
+            let na = normalize_path(&a);
+            prop_assert_eq!(hash_path(&a), hash_path(&na));
+            prop_assert!(paths_eq(&a, &na));
+            prop_assert_eq!(paths_eq(&a, &b), na == normalize_path(&b));
+        }
 
         /// Serializing arbitrary (deduplicated) path/CKey pairs as
         /// `path|hex\r\n` lines and parsing them back must reproduce every

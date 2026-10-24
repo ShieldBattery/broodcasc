@@ -45,12 +45,12 @@ fn reads_installed_files() {
 
     let mut read = 0;
     for entry in storage.root().entries() {
-        if !storage.is_installed(&entry.path) {
+        if !storage.is_installed(entry.path) {
             continue;
         }
-        let expected_size = storage.file_size(&entry.path).expect("size should resolve");
+        let expected_size = storage.file_size(entry.path).expect("size should resolve");
         let bytes = storage
-            .read_file(&entry.path)
+            .read_file(entry.path)
             .unwrap_or_else(|e| panic!("reading {} failed: {e}", entry.path));
         assert_eq!(
             bytes.len() as u64,
@@ -78,13 +78,13 @@ fn reads_a_large_multi_chunk_file() {
         .root()
         .entries()
         .find(|e| {
-            storage.is_installed(&e.path) && storage.file_size(&e.path).is_ok_and(|s| s > 1_000_000)
+            storage.is_installed(e.path) && storage.file_size(e.path).is_ok_and(|s| s > 1_000_000)
         })
         .expect("some large installed file should exist");
     let bytes = storage
-        .read_file(&entry.path)
+        .read_file(entry.path)
         .expect("large read should work");
-    assert_eq!(bytes.len() as u64, storage.file_size(&entry.path).unwrap());
+    assert_eq!(bytes.len() as u64, storage.file_size(entry.path).unwrap());
 }
 
 #[test]
@@ -96,15 +96,15 @@ fn read_file_into_matches_read_file() {
     let installed = storage
         .root()
         .entries()
-        .filter(|e| storage.is_installed(&e.path));
+        .filter(|e| storage.is_installed(e.path));
     let large = installed
         .clone()
-        .find(|e| storage.file_size(&e.path).is_ok_and(|s| s > 1_000_000));
+        .find(|e| storage.file_size(e.path).is_ok_and(|s| s > 1_000_000));
     for entry in installed.take(20).chain(large) {
-        let expected = storage.read_file(&entry.path).unwrap();
-        let mut out = vec![0; storage.file_size(&entry.path).unwrap() as usize];
+        let expected = storage.read_file(entry.path).unwrap();
+        let mut out = vec![0; storage.file_size(entry.path).unwrap() as usize];
         storage
-            .read_file_into(&entry.path, &mut out)
+            .read_file_into(entry.path, &mut out)
             .unwrap_or_else(|e| panic!("read_file_into {} failed: {e}", entry.path));
         assert!(out == expected, "content mismatch for {}", entry.path);
 
@@ -112,7 +112,7 @@ fn read_file_into_matches_read_file() {
             if len == out.len() {
                 continue;
             }
-            match storage.read_file_into(&entry.path, &mut vec![0; len]) {
+            match storage.read_file_into(entry.path, &mut vec![0; len]) {
                 Err(CascError::OutputSizeMismatch { .. }) => {}
                 other => panic!("expected OutputSizeMismatch, got {other:?}"),
             }
@@ -154,9 +154,9 @@ fn missing_and_uninstalled_paths_error_distinctly() {
     if let Some(entry) = storage
         .root()
         .entries()
-        .find(|e| !storage.is_installed(&e.path))
+        .find(|e| !storage.is_installed(e.path))
     {
-        match storage.read_file(&entry.path) {
+        match storage.read_file(entry.path) {
             Err(CascError::NotInstalled(_)) => {}
             other => panic!("expected NotInstalled for {}, got {other:?}", entry.path),
         }
