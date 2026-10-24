@@ -81,6 +81,16 @@ pub struct EncodingEntry {
 #[derive(Debug, Clone, Default)]
 pub struct EncodingTable {
     entries: Vec<EncodingEntry>,
+    /// `starts[b]..starts[b + 1]` is the range of entries whose CKey's top
+    /// `16 - shift` bits equal `b`. Always has at least two elements, except
+    /// for `Default`, where lookups find nothing.
+    starts: Box<[u32]>,
+    shift: u32,
+}
+
+/// The first two bytes of a CKey as a big-endian integer.
+fn prefix16(ckey: &ContentKey) -> u32 {
+    u32::from(u16::from_be_bytes([ckey.0[0], ckey.0[1]]))
 }
 
 impl EncodingTable {
@@ -126,7 +136,7 @@ impl EncodingTable {
         let mut total = 0usize;
         for (page, index_entry) in pages
             .chunks_exact(header.ckey_page_size)
-            .zip(page_index.chunks_exact(PAGE_INDEX_ENTRY_SIZE))
+            .zip(page_index.as_chunks::<PAGE_INDEX_ENTRY_SIZE>().0)
         {
             let actual_md5: [u8; 16] = Md5::digest(page).into();
             if actual_md5 != index_entry[KEY_SIZE..] {
@@ -139,20 +149,46 @@ impl EncodingTable {
         let mut entries = Vec::with_capacity(total);
         for (page, index_entry) in pages
             .chunks_exact(header.ckey_page_size)
-            .zip(page_index.chunks_exact(PAGE_INDEX_ENTRY_SIZE))
+            .zip(page_index.as_chunks::<PAGE_INDEX_ENTRY_SIZE>().0)
         {
             parse_page(page, &index_entry[..KEY_SIZE], &mut entries)?;
         }
 
-        Ok(EncodingTable { entries })
+        Ok(EncodingTable::from_sorted(entries))
     }
 
-    /// Looks up an entry by CKey via binary search.
+    /// Builds the bucket index over CKey-sorted `entries`.
+    fn from_sorted(entries: Vec<EncodingEntry>) -> EncodingTable {
+        // ~4 entries per bucket, at most 16 bits of key prefix (u32 starts
+        // bound the table at 4 GiB entries, far above what the page-size
+        // arithmetic can produce from a u32 page count).
+        let bits = (entries.len() / 4).checked_ilog2().map_or(0, |b| b.min(16));
+        let shift = 16 - bits;
+        let mut starts = vec![0u32; (1usize << bits) + 1];
+        for entry in &entries {
+            starts[(prefix16(&entry.ckey) >> shift) as usize + 1] += 1;
+        }
+        for i in 1..starts.len() {
+            starts[i] += starts[i - 1];
+        }
+        EncodingTable {
+            entries,
+            starts: starts.into_boxed_slice(),
+            shift,
+        }
+    }
+
+    /// Looks up an entry by CKey. CKeys are MD5 digests, so their leading
+    /// bits are uniformly distributed; those select a small bucket that is
+    /// then binary-searched.
     pub fn lookup(&self, ckey: &ContentKey) -> Option<&EncodingEntry> {
-        self.entries
+        let bucket = (prefix16(ckey) >> self.shift) as usize;
+        let range = *self.starts.get(bucket)? as usize..*self.starts.get(bucket + 1)? as usize;
+        let slice = self.entries.get(range)?;
+        slice
             .binary_search_by(|entry| entry.ckey.cmp(ckey))
             .ok()
-            .map(|i| &self.entries[i])
+            .map(|i| &slice[i])
     }
 
     /// All entries, sorted by CKey.
@@ -464,6 +500,48 @@ mod tests {
 
         assert!(table.lookup(&ContentKey([0; 16])).is_none());
         assert!(table.lookup(&ContentKey([41; 16])).is_none());
+    }
+
+    #[test]
+    fn bucketed_lookup_covers_prefix_extremes() {
+        // Enough entries for a multi-bit bucket index, spread across the
+        // whole prefix space including its first and last buckets.
+        let mut ckeys: Vec<[u8; 16]> = (0..2000u32)
+            .map(|i| {
+                let p = (i * 32771 % 65536) as u16;
+                let mut k = [(i % 251) as u8; 16];
+                k[..2].copy_from_slice(&p.to_be_bytes());
+                k
+            })
+            .collect();
+        ckeys.push([0; 16]);
+        ckeys.push([0xFF; 16]);
+        ckeys.sort();
+        ckeys.dedup();
+        let entries: Vec<RawEntry> = ckeys
+            .iter()
+            .enumerate()
+            .map(|(i, &k)| RawEntry {
+                ckey: ContentKey(k),
+                ekeys: vec![EncodingKey([i as u8; 16])],
+                size: i as u64,
+            })
+            .collect();
+        let table = EncodingTable::parse(&build_encoding(&entries, 4)).unwrap();
+        assert_eq!(table.len(), ckeys.len());
+        for (i, &k) in ckeys.iter().enumerate() {
+            assert_eq!(table.lookup(&ContentKey(k)).unwrap().size, i as u64);
+            let mut miss = k;
+            miss[15] ^= 0x5A;
+            if ckeys.binary_search(&miss).is_err() {
+                assert!(table.lookup(&ContentKey(miss)).is_none());
+            }
+        }
+        assert!(
+            EncodingTable::default()
+                .lookup(&ContentKey([7; 16]))
+                .is_none()
+        );
     }
 
     #[test]
