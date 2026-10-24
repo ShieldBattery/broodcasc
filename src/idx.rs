@@ -66,7 +66,7 @@ const MAX_INDEX_ENTRIES: usize = 1_000_000;
 fn entry_block_hash(entries: &[u8]) -> u32 {
     let mut hi = 0;
     let mut lo = 0;
-    for entry in entries.chunks_exact(ENTRY_LEN) {
+    for entry in entries.as_chunks::<ENTRY_LEN>().0 {
         (hi, lo) = hashlittle2(entry, hi, lo);
     }
     hi
@@ -309,7 +309,7 @@ fn parse_file(data: &[u8], out: &mut HashMap<TruncatedKey, IdxEntry>) -> Result<
             limit: MAX_INDEX_ENTRIES,
         })?;
 
-    for entry in entry_bytes.chunks_exact(ENTRY_LEN) {
+    for entry in entry_bytes.as_chunks::<ENTRY_LEN>().0 {
         let mut key9 = [0u8; 9];
         key9.copy_from_slice(&entry[0..9]);
 
