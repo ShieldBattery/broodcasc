@@ -43,17 +43,64 @@ pub(crate) fn read_verified_prefixed(
     prefix_len: usize,
     acquire: impl FnOnce(usize) -> Result<Vec<u8>>,
 ) -> Result<Vec<u8>> {
-    if let Some(size) = expected.decoded_size {
-        usize::try_from(size)
-            .ok()
-            .filter(|&size| size <= limits.max_decoded_bytes)
-            .ok_or(CascError::LimitExceeded {
-                what: "decoded object",
-                limit: limits.max_decoded_bytes,
-            })?;
-    }
+    let decoded_size = expected
+        .decoded_size
+        .map(|size| check_decoded_size(size, limits))
+        .transpose()?;
 
     let acquired = acquire(limits.max_encoded_bytes)?;
+    let encoded = encoded_suffix(&acquired, prefix_len, limits)?;
+
+    let decoded = match decoded_size {
+        // Expected sizes come from verified metadata (encoding table, build
+        // config), so the output is allocated once at its final size rather
+        // than grown from `initial_reserve_bytes`.
+        Some(size) => {
+            let mut decoded = Vec::new();
+            decoded
+                .try_reserve_exact(size)
+                .map_err(|_| CascError::LimitExceeded {
+                    what: "decoded object allocation",
+                    limit: limits.max_decoded_bytes,
+                })?;
+            decoded.resize(size, 0);
+            blte::decode_into(encoded, &mut decoded, limits)?;
+            decoded
+        }
+        None => blte::decode_with_limits(encoded, limits)?,
+    };
+    verify_ckey(&decoded, expected.ckey)?;
+    Ok(decoded)
+}
+
+/// Variant of [`read_verified_prefixed`] that decodes into caller-provided
+/// memory. `out.len()` is the expected decoded size; it is checked against
+/// the limits before anything is acquired.
+pub(crate) fn read_verified_into_prefixed(
+    ckey: Option<&ContentKey>,
+    out: &mut [u8],
+    limits: ReadLimits,
+    prefix_len: usize,
+    acquire: impl FnOnce(usize) -> Result<Vec<u8>>,
+) -> Result<()> {
+    check_decoded_size(out.len() as u64, limits)?;
+    let acquired = acquire(limits.max_encoded_bytes)?;
+    let encoded = encoded_suffix(&acquired, prefix_len, limits)?;
+    blte::decode_into(encoded, out, limits)?;
+    verify_ckey(out, ckey)
+}
+
+fn check_decoded_size(size: u64, limits: ReadLimits) -> Result<usize> {
+    usize::try_from(size)
+        .ok()
+        .filter(|&size| size <= limits.max_decoded_bytes)
+        .ok_or(CascError::LimitExceeded {
+            what: "decoded object",
+            limit: limits.max_decoded_bytes,
+        })
+}
+
+fn encoded_suffix(acquired: &[u8], prefix_len: usize, limits: ReadLimits) -> Result<&[u8]> {
     let encoded = acquired.get(prefix_len..).ok_or_else(|| {
         CascError::malformed("encoded object", "framing prefix exceeds acquired bytes")
     })?;
@@ -63,26 +110,17 @@ pub(crate) fn read_verified_prefixed(
             limit: limits.max_encoded_bytes,
         });
     }
+    Ok(encoded)
+}
 
-    let decoded = blte::decode_with_limits(encoded, limits)?;
-    if let Some(expected_size) = expected.decoded_size
-        && decoded.len() as u64 != expected_size
-    {
-        return Err(CascError::malformed(
-            "decoded content",
-            format!(
-                "length {} does not match expected size {expected_size}",
-                decoded.len()
-            ),
-        ));
-    }
-    if let Some(ckey) = expected.ckey {
-        let actual_ckey: [u8; 16] = Md5::digest(&decoded).into();
+fn verify_ckey(decoded: &[u8], ckey: Option<&ContentKey>) -> Result<()> {
+    if let Some(ckey) = ckey {
+        let actual_ckey: [u8; 16] = Md5::digest(decoded).into();
         if actual_ckey != *ckey.as_bytes() {
             return Err(CascError::ChecksumMismatch("decoded content (CKey)"));
         }
     }
-    Ok(decoded)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -158,9 +196,64 @@ mod tests {
         assert!(matches!(
             err,
             CascError::Malformed {
-                what: "decoded content",
+                what: "BLTE chunk",
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn oversized_output_buffer_rejects_before_acquisition() {
+        let limits = ReadLimits {
+            max_decoded_bytes: 1,
+            ..ReadLimits::default()
+        };
+        let called = std::cell::Cell::new(false);
+        let mut out = [0u8; 2];
+        let err = read_verified_into_prefixed(None, &mut out, limits, 0, |_| {
+            called.set(true);
+            Ok(single_raw(b"ok"))
+        })
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CascError::LimitExceeded {
+                what: "decoded object",
+                ..
+            }
+        ));
+        assert!(!called.get());
+    }
+
+    #[test]
+    fn verified_object_is_decoded_into_buffer() {
+        let payload = b"ok";
+        let mut out = [0u8; 2];
+        read_verified_into_prefixed(
+            Some(&ckey(payload)),
+            &mut out,
+            ReadLimits::default(),
+            1,
+            |_| {
+                let mut acquired = vec![0xAA];
+                acquired.extend_from_slice(&single_raw(payload));
+                Ok(acquired)
+            },
+        )
+        .unwrap();
+        assert_eq!(&out, payload);
+
+        let err = read_verified_into_prefixed(
+            Some(&ContentKey::from([0; 16])),
+            &mut out,
+            ReadLimits::default(),
+            0,
+            |_| Ok(single_raw(payload)),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            CascError::ChecksumMismatch("decoded content (CKey)")
         ));
     }
 

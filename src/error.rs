@@ -27,6 +27,10 @@ pub enum CascError {
     /// An untrusted object exceeded a caller-configured resource limit.
     #[error("{what} exceeds configured limit ({limit})")]
     LimitExceeded { what: &'static str, limit: usize },
+    /// A caller-provided output buffer's length doesn't match the decoded
+    /// size of the requested content. Reported before anything is read.
+    #[error("output buffer is {actual} bytes, but the decoded content is {expected} bytes")]
+    OutputSizeMismatch { expected: u64, actual: usize },
 }
 
 impl CascError {

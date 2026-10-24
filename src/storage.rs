@@ -18,7 +18,7 @@ use crate::idx::{IdxEntry, LocalIndex};
 use crate::io::{ReadAt, StorageProvider};
 use crate::jenkins::hashlittle2;
 use crate::keys::{ContentKey, EncodingKey};
-use crate::object::{ExpectedObject, read_verified_prefixed};
+use crate::object::{ExpectedObject, read_verified_into_prefixed, read_verified_prefixed};
 use crate::root::RootFile;
 
 /// Size of the span header preceding every BLTE stream in a `data.###`
@@ -118,6 +118,27 @@ impl<P: StorageProvider> SpanReader<P> {
                 ckey: expected_ckey,
                 decoded_size,
             },
+            self.limits,
+            SPAN_HEADER_SIZE as usize,
+            |encoded_limit| self.read_span(ekey, &entry, encoded_limit),
+        )
+    }
+
+    /// Like [`Self::read_by_ekey`], decoding into `out`, whose length is the
+    /// expected decoded size.
+    fn read_by_ekey_into(
+        &self,
+        ekey: &EncodingKey,
+        expected_ckey: Option<&ContentKey>,
+        out: &mut [u8],
+    ) -> Result<()> {
+        let entry = *self
+            .index
+            .lookup(ekey)
+            .ok_or_else(|| CascError::NotFound(ekey.to_string()))?;
+        read_verified_into_prefixed(
+            expected_ckey,
+            out,
             self.limits,
             SPAN_HEADER_SIZE as usize,
             |encoded_limit| self.read_span(ekey, &entry, encoded_limit),
@@ -354,6 +375,25 @@ impl<P: StorageProvider> Storage<P> {
         })
     }
 
+    /// Reads and decodes `path` into `out`, which must be exactly
+    /// [`Storage::file_size`] bytes. Lets callers decode straight into memory
+    /// they own (e.g. an `Arc<[u8]>`) instead of copying out of a `Vec`.
+    ///
+    /// Verification and errors match [`Storage::read_file`]; a wrong-length
+    /// `out` fails with [`CascError::OutputSizeMismatch`] before anything is
+    /// read. On error, `out`'s contents are unspecified.
+    pub fn read_file_into(&self, path: &str, out: &mut [u8]) -> Result<()> {
+        let entry = self
+            .root
+            .lookup(path)
+            .ok_or_else(|| CascError::NotFound(path.to_string()))?;
+        self.read_by_ckey_into(&entry.ckey, out)
+            .map_err(|e| match e {
+                CascError::NotFound(_) => CascError::NotInstalled(path.to_string()),
+                other => other,
+            })
+    }
+
     /// The decoded size of a file, without reading it (from the encoding
     /// table).
     pub fn file_size(&self, path: &str) -> Result<u64> {
@@ -397,6 +437,22 @@ impl<P: StorageProvider> Storage<P> {
             .ok_or_else(|| CascError::NotFound(ckey.to_string()))?;
         self.spans
             .read_by_ekey(&enc.ekey, Some(ckey), Some(enc.size))
+    }
+
+    /// Reads and decodes content by CKey into `out`, which must be exactly
+    /// the encoding table's decoded size; see [`Storage::read_file_into`].
+    pub fn read_by_ckey_into(&self, ckey: &ContentKey, out: &mut [u8]) -> Result<()> {
+        let enc = self
+            .encoding
+            .lookup(ckey)
+            .ok_or_else(|| CascError::NotFound(ckey.to_string()))?;
+        if out.len() as u64 != enc.size {
+            return Err(CascError::OutputSizeMismatch {
+                expected: enc.size,
+                actual: out.len(),
+            });
+        }
+        self.spans.read_by_ekey_into(&enc.ekey, Some(ckey), out)
     }
 
     /// Reads and decodes content selected by EKey. When `expected_ckey` is

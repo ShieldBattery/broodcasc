@@ -34,6 +34,14 @@ let chk = storage.read_file("SD/campaign/Starcraft/SWAR/staredit/scenario.chk")?
 for name in storage.file_names() {
     println!("{name}");
 }
+
+// Or decode straight into memory you own, e.g. a shared `Arc<[u8]>`, without
+// an intermediate `Vec` (the buffer must be exactly `file_size` bytes).
+// Collecting a `repeat_n` allocates the `Arc` once, with no copy.
+let path = "SD/mainSD.anim";
+let size = storage.file_size(path)? as usize;
+let mut bytes: std::sync::Arc<[u8]> = std::iter::repeat_n(0, size).collect();
+storage.read_file_into(path, std::sync::Arc::get_mut(&mut bytes).unwrap())?;
 ```
 
 CKey-addressed reads verify BLTE chunk MD5s, the expected decoded size, and

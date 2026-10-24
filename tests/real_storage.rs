@@ -89,6 +89,40 @@ fn reads_a_large_multi_chunk_file() {
 }
 
 #[test]
+fn read_file_into_matches_read_file() {
+    let Some(storage) = open_storage() else {
+        return;
+    };
+
+    let installed = storage
+        .root()
+        .entries()
+        .iter()
+        .filter(|e| storage.is_installed(&e.path));
+    let large = installed
+        .clone()
+        .find(|e| storage.file_size(&e.path).is_ok_and(|s| s > 1_000_000));
+    for entry in installed.take(20).chain(large) {
+        let expected = storage.read_file(&entry.path).unwrap();
+        let mut out = vec![0; storage.file_size(&entry.path).unwrap() as usize];
+        storage
+            .read_file_into(&entry.path, &mut out)
+            .unwrap_or_else(|e| panic!("read_file_into {} failed: {e}", entry.path));
+        assert!(out == expected, "content mismatch for {}", entry.path);
+
+        for len in [out.len() + 1, out.len().saturating_sub(1)] {
+            if len == out.len() {
+                continue;
+            }
+            match storage.read_file_into(&entry.path, &mut vec![0; len]) {
+                Err(CascError::OutputSizeMismatch { .. }) => {}
+                other => panic!("expected OutputSizeMismatch, got {other:?}"),
+            }
+        }
+    }
+}
+
+#[test]
 fn lookup_is_case_and_separator_insensitive() {
     let Some(storage) = open_storage() else {
         return;
