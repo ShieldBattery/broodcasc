@@ -30,11 +30,11 @@ cdn-http = ["cdn", "dep:ureq"]
 md-5 = "0.11"
 miniz_oxide = "0.9"
 thiserror = "2.0"
-ureq = { version = "3.3", optional = true }
+ureq = { version = "3.5", optional = true }
 
 [dev-dependencies]
 assert_ok = "1.0"
-proptest = "1.11"
+proptest = "1.12"
 
 [[example]]
 name = "extract_fuzz_corpus"
