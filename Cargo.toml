@@ -16,7 +16,7 @@ keywords = ["casc", "starcraft", "blizzard", "archive"]
 categories = ["parser-implementations", "game-development"]
 
 [features]
-default = ["fs", "cdn"]
+default = ["fs", "cdn", "fast-inflate"]
 # Local filesystem storage backend (not available on wasm32-unknown-unknown)
 fs = []
 # CDN ("online") storage core: discovery/index parsing and CdnStorage over a
@@ -25,11 +25,16 @@ fs = []
 cdn = []
 # Batteries-included native HTTP transport for `cdn`, using ureq.
 cdn-http = ["cdn", "dep:ureq"]
+# Inflate BLTE `Z` chunks with zlib-rs (~30% faster decode natively, more
+# code) instead of the smaller miniz_oxide. Pure Rust either way; leave it off
+# for size-sensitive wasm builds.
+fast-inflate = ["dep:zlib-rs"]
 
 [dependencies]
 md-5 = "0.11"
 miniz_oxide = "0.9"
 thiserror = "2.0"
+zlib-rs = { version = "0.6.8", default-features = false, features = ["std"], optional = true }
 ureq = { version = "3.5", optional = true }
 
 [dev-dependencies]

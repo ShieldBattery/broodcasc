@@ -36,12 +36,8 @@
 //! - `F`: a nested BLTE stream (recursed into).
 //! - `E`: Salsa20/ARC4-encrypted data (unsupported here).
 
-use std::iter;
-
+use crate::zlib::{Inflater, inflate_exact, inflate_to_vec};
 use md5::{Digest, Md5};
-use miniz_oxide::inflate::{
-    TINFLStatus, decompress_slice_iter_to_slice, decompress_to_vec_zlib_with_limit,
-};
 
 use crate::error::{CascError, Result};
 #[cfg(not(target_arch = "wasm32"))]
@@ -270,6 +266,7 @@ pub fn decode_chunk(
         0,
         limits,
         limits.max_decoded_bytes,
+        &mut Inflater::default(),
     )
 }
 
@@ -280,6 +277,7 @@ fn decode_chunk_inner(
     depth: u32,
     limits: ReadLimits,
     remaining_output: usize,
+    inflater: &mut Inflater,
 ) -> Result<Vec<u8>> {
     if let Some(expected) = expected_md5 {
         let actual: [u8; 16] = Md5::digest(encoded).into();
@@ -315,23 +313,22 @@ fn decode_chunk_inner(
             if let Some(expected) = expected_size {
                 check_chunk_output(expected, limits, remaining_output)?;
             }
-            let output_limit =
-                expected_size.unwrap_or(remaining_output.min(limits.max_chunk_decoded_bytes));
-            let decoded =
-                decompress_to_vec_zlib_with_limit(payload, output_limit).map_err(|e| {
-                    CascError::malformed("BLTE chunk", format!("zlib inflate failed: {e:?}"))
-                })?;
-            if let Some(expected) = expected_size
-                && decoded.len() != expected
-            {
-                return Err(CascError::malformed(
-                    "BLTE chunk",
-                    format!(
-                        "mode 'Z' decompressed length {} does not match declared decompressed_size {expected}",
-                        decoded.len()
-                    ),
-                ));
-            }
+            let decoded = match expected_size {
+                Some(expected) => {
+                    let mut decoded = Vec::new();
+                    decoded
+                        .try_reserve_exact(expected)
+                        .map_err(|_| limit("BLTE decoded chunk", limits.max_chunk_decoded_bytes))?;
+                    decoded.resize(expected, 0);
+                    inflate_exact(inflater, payload, &mut decoded)?;
+                    decoded
+                }
+                None => inflate_to_vec(
+                    inflater,
+                    payload,
+                    remaining_output.min(limits.max_chunk_decoded_bytes),
+                )?,
+            };
             check_chunk_output(decoded.len(), limits, remaining_output)?;
             Ok(decoded)
         }
@@ -350,7 +347,7 @@ fn decode_chunk_inner(
             }
             let nested_limit =
                 expected_size.unwrap_or(remaining_output.min(limits.max_chunk_decoded_bytes));
-            let decoded = decode_inner(payload, depth + 1, limits, nested_limit)?;
+            let decoded = decode_inner(payload, depth + 1, limits, nested_limit, inflater)?;
             if let Some(expected) = expected_size
                 && decoded.len() != expected
             {
@@ -383,7 +380,13 @@ pub fn decode(data: &[u8]) -> Result<Vec<u8>> {
 
 /// Decodes a complete BLTE-encoded buffer under explicit resource limits.
 pub fn decode_with_limits(data: &[u8], limits: ReadLimits) -> Result<Vec<u8>> {
-    decode_inner(data, 0, limits, limits.max_decoded_bytes)
+    decode_inner(
+        data,
+        0,
+        limits,
+        limits.max_decoded_bytes,
+        &mut Inflater::default(),
+    )
 }
 
 fn decode_inner(
@@ -391,6 +394,7 @@ fn decode_inner(
     depth: u32,
     limits: ReadLimits,
     output_limit: usize,
+    inflater: &mut Inflater,
 ) -> Result<Vec<u8>> {
     if data.len() > limits.max_encoded_bytes {
         return Err(limit("BLTE encoded input", limits.max_encoded_bytes));
@@ -400,7 +404,7 @@ fn decode_inner(
     if header.chunks.is_empty() {
         // header_size == 0: entire remainder is a single chunk of unknown size.
         let encoded = implicit_chunk(data, &header)?;
-        return decode_chunk_inner(encoded, None, None, depth, limits, output_limit);
+        return decode_chunk_inner(encoded, None, None, depth, limits, output_limit, inflater);
     }
 
     let declared_total = validate_chunk_table(data.len(), &header, limits)?;
@@ -414,18 +418,20 @@ fn decode_inner(
     out.try_reserve_exact(initial)
         .map_err(|_| limit("BLTE decoded output allocation", output_limit))?;
     for chunk in &header.chunks {
-        let encoded = chunk_data(data, chunk)?;
-        let decoded = decode_chunk_inner(
-            encoded,
-            Some(chunk.decompressed_size as usize),
-            None,
+        // Each chunk decodes straight into the tail of `out`; its size was
+        // checked against the limits by `validate_chunk_table` above.
+        let start = out.len();
+        let end = start + chunk.decompressed_size as usize;
+        out.try_reserve(chunk.decompressed_size as usize)
+            .map_err(|_| limit("BLTE decoded output allocation", output_limit))?;
+        out.resize(end, 0);
+        decode_chunk_into(
+            chunk_data(data, chunk)?,
+            &mut out[start..end],
             depth,
             limits,
-            output_limit - out.len(),
+            inflater,
         )?;
-        out.try_reserve(decoded.len())
-            .map_err(|_| limit("BLTE decoded output allocation", output_limit))?;
-        out.extend_from_slice(&decoded);
     }
     Ok(out)
 }
@@ -442,17 +448,23 @@ pub fn decode_into(data: &[u8], out: &mut [u8], limits: ReadLimits) -> Result<()
     if out.len() > limits.max_decoded_bytes {
         return Err(limit("BLTE decoded output", limits.max_decoded_bytes));
     }
-    decode_into_inner(data, out, 0, limits)
+    decode_into_inner(data, out, 0, limits, &mut Inflater::default())
 }
 
-fn decode_into_inner(data: &[u8], out: &mut [u8], depth: u32, limits: ReadLimits) -> Result<()> {
+fn decode_into_inner(
+    data: &[u8],
+    out: &mut [u8],
+    depth: u32,
+    limits: ReadLimits,
+    inflater: &mut Inflater,
+) -> Result<()> {
     let header = parse_with_limits(data, limits)?;
 
     if header.chunks.is_empty() {
         // header_size == 0: the output length stands in for the missing
         // declared size.
         let encoded = implicit_chunk(data, &header)?;
-        return decode_chunk_into(encoded, out, depth, limits);
+        return decode_chunk_into(encoded, out, depth, limits, inflater);
     }
 
     let declared_total = validate_chunk_table(data.len(), &header, limits)?;
@@ -474,7 +486,7 @@ fn decode_into_inner(data: &[u8], out: &mut [u8], depth: u32, limits: ReadLimits
             .split_at_mut_checked(chunk.decompressed_size as usize)
             .ok_or_else(|| CascError::malformed("BLTE chunk table", "decoded size overflow"))?;
         rest = tail;
-        decode_chunk_into(chunk_data(data, chunk)?, dst, depth, limits)?;
+        decode_chunk_into(chunk_data(data, chunk)?, dst, depth, limits, inflater)?;
     }
     Ok(())
 }
@@ -482,7 +494,13 @@ fn decode_into_inner(data: &[u8], out: &mut [u8], depth: u32, limits: ReadLimits
 /// Decodes one chunk into `out`, whose length is the chunk's declared (or,
 /// for header-less BLTE, expected) decoded size. The chunk's MD5, if it has
 /// one, must already have been checked by [`verify_chunk_md5s`].
-fn decode_chunk_into(encoded: &[u8], out: &mut [u8], depth: u32, limits: ReadLimits) -> Result<()> {
+fn decode_chunk_into(
+    encoded: &[u8],
+    out: &mut [u8],
+    depth: u32,
+    limits: ReadLimits,
+    inflater: &mut Inflater,
+) -> Result<()> {
     let Some((&mode, payload)) = encoded.split_first() else {
         return Err(CascError::malformed(
             "BLTE chunk",
@@ -515,24 +533,7 @@ fn decode_chunk_into(encoded: &[u8], out: &mut [u8], depth: u32, limits: ReadLim
         }
         b'Z' => {
             check_len()?;
-            let expected = out.len();
-            match decompress_slice_iter_to_slice(out, iter::once(payload), true, false) {
-                Ok(written) if written == expected => Ok(()),
-                Ok(written) => Err(CascError::malformed(
-                    "BLTE chunk",
-                    format!(
-                        "mode 'Z' decompressed length {written} does not match declared decompressed_size {expected}"
-                    ),
-                )),
-                Err(TINFLStatus::HasMoreOutput) => Err(CascError::malformed(
-                    "BLTE chunk",
-                    format!("mode 'Z' decompresses past declared decompressed_size {expected}"),
-                )),
-                Err(status) => Err(CascError::malformed(
-                    "BLTE chunk",
-                    format!("zlib inflate failed: {status:?}"),
-                )),
-            }
+            inflate_exact(inflater, payload, out)
         }
         b'F' => {
             check_len()?;
@@ -545,7 +546,7 @@ fn decode_chunk_into(encoded: &[u8], out: &mut [u8], depth: u32, limits: ReadLim
                     ),
                 ));
             }
-            decode_into_inner(payload, out, depth + 1, limits)
+            decode_into_inner(payload, out, depth + 1, limits, inflater)
         }
         b'E' => Err(CascError::Unsupported {
             what: "BLTE chunk",
@@ -689,6 +690,7 @@ impl<R: ChunkRead> ChunkStream<R> {
             ));
         }
         let chunks = &self.header.chunks;
+        let mut inflater = Inflater::default();
         let mut rest = out;
         let mut i = 0;
         while i < chunks.len() {
@@ -738,7 +740,7 @@ impl<R: ChunkRead> ChunkStream<R> {
                         CascError::malformed("BLTE chunk table", "decoded size overflow")
                     })?;
                 rest = tail;
-                decode_chunk_into(encoded(chunk), dst, 0, self.limits)?;
+                decode_chunk_into(encoded(chunk), dst, 0, self.limits, &mut inflater)?;
             }
             i = j;
         }
@@ -1227,13 +1229,62 @@ mod tests {
         let inner = build_blte(&[(b'N', b"ok", 2)]);
         let outer = build_blte(&[(b'F', &inner, 3)]);
         let err = decode(&outer).unwrap_err();
-        assert!(matches!(
-            err,
-            CascError::Malformed {
-                what: "BLTE chunk",
-                ..
-            }
-        ));
+        assert!(matches!(err, CascError::Malformed { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn empty_zlib_chunk_decodes_to_nothing() {
+        let compressed = zlib(b"");
+        let blte = build_blte(&[(b'Z', &compressed, 0)]);
+        assert_eq!(decode(&blte).unwrap(), b"");
+        assert!(
+            decode_into_vec(&blte, 0, ReadLimits::default())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(decode(&build_single_chunk(b'Z', &compressed)).unwrap(), b"");
+    }
+
+    #[test]
+    fn headerless_zlib_grows_past_initial_buffer_and_honors_limit() {
+        // Highly compressible, so the initial 4x-of-input guess is far too small.
+        let raw = vec![7u8; 1 << 20];
+        let blte = build_single_chunk(b'Z', &zlib(&raw));
+        assert_eq!(decode(&blte).unwrap(), raw);
+
+        let limits = ReadLimits {
+            max_decoded_bytes: raw.len() - 1,
+            ..ReadLimits::default()
+        };
+        assert!(decode_with_limits(&blte, limits).is_err());
+        let limits = ReadLimits {
+            max_decoded_bytes: raw.len(),
+            ..ReadLimits::default()
+        };
+        assert_eq!(decode_with_limits(&blte, limits).unwrap(), raw);
+    }
+
+    #[test]
+    fn truncated_and_corrupt_zlib_streams_are_rejected() {
+        let raw: Vec<u8> = (0..5000u32).map(|i| (i * 7 % 251) as u8).collect();
+        let compressed = zlib(&raw);
+        for bad in [
+            compressed[..compressed.len() - 1].to_vec(), // missing adler byte
+            compressed[..compressed.len() / 2].to_vec(),
+            {
+                let mut c = compressed.clone();
+                let last = c.len() - 1;
+                c[last] ^= 1; // adler32 mismatch
+                c
+            },
+        ] {
+            let table = build_blte(&[(b'Z', &bad, raw.len() as u32)]);
+            let headerless = build_single_chunk(b'Z', &bad);
+            assert!(decode(&table).is_err());
+            assert!(decode(&headerless).is_err());
+            assert!(decode_into_vec(&table, raw.len(), ReadLimits::default()).is_err());
+            assert!(decode_into_vec(&headerless, raw.len(), ReadLimits::default()).is_err());
+        }
     }
 
     fn decode_into_vec(blte: &[u8], len: usize, limits: ReadLimits) -> Result<Vec<u8>> {

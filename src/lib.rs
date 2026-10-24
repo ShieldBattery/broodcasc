@@ -34,6 +34,7 @@ pub mod root;
 pub mod storage;
 #[cfg(feature = "cdn")]
 pub mod tact;
+mod zlib;
 
 pub use blte::ReadLimits;
 #[cfg(feature = "cdn")]
