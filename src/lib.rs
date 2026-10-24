@@ -26,6 +26,9 @@ pub mod idx;
 pub mod io;
 mod jenkins;
 pub mod keys;
+// Multi-lane MD5; not worth its code size on wasm32 (see `blte`).
+#[cfg(not(target_arch = "wasm32"))]
+mod md5lanes;
 mod object;
 pub mod root;
 pub mod storage;

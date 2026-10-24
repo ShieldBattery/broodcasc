@@ -44,6 +44,8 @@ use miniz_oxide::inflate::{
 };
 
 use crate::error::{CascError, Result};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::md5lanes::hash_many;
 
 const MAGIC: &[u8; 4] = b"BLTE";
 /// Size of one chunk table entry: compressed_size(4) + decompressed_size(4) + md5(16).
@@ -405,6 +407,7 @@ fn decode_inner(
     if declared_total > output_limit {
         return Err(limit("BLTE decoded output", output_limit));
     }
+    verify_chunk_md5s(data, &header.chunks)?;
 
     let mut out = Vec::new();
     let initial = declared_total.min(limits.initial_reserve_bytes);
@@ -415,7 +418,7 @@ fn decode_inner(
         let decoded = decode_chunk_inner(
             encoded,
             Some(chunk.decompressed_size as usize),
-            Some(&chunk.md5),
+            None,
             depth,
             limits,
             output_limit - out.len(),
@@ -449,7 +452,7 @@ fn decode_into_inner(data: &[u8], out: &mut [u8], depth: u32, limits: ReadLimits
         // header_size == 0: the output length stands in for the missing
         // declared size.
         let encoded = implicit_chunk(data, &header)?;
-        return decode_chunk_into(encoded, out, None, depth, limits);
+        return decode_chunk_into(encoded, out, depth, limits);
     }
 
     let declared_total = validate_chunk_table(data.len(), &header, limits)?;
@@ -463,39 +466,23 @@ fn decode_into_inner(data: &[u8], out: &mut [u8], depth: u32, limits: ReadLimits
         ));
     }
 
+    verify_chunk_md5s(data, &header.chunks)?;
+
     let mut rest = out;
     for chunk in &header.chunks {
         let (dst, tail) = rest
             .split_at_mut_checked(chunk.decompressed_size as usize)
             .ok_or_else(|| CascError::malformed("BLTE chunk table", "decoded size overflow"))?;
         rest = tail;
-        decode_chunk_into(
-            chunk_data(data, chunk)?,
-            dst,
-            Some(&chunk.md5),
-            depth,
-            limits,
-        )?;
+        decode_chunk_into(chunk_data(data, chunk)?, dst, depth, limits)?;
     }
     Ok(())
 }
 
 /// Decodes one chunk into `out`, whose length is the chunk's declared (or,
-/// for header-less BLTE, expected) decoded size.
-fn decode_chunk_into(
-    encoded: &[u8],
-    out: &mut [u8],
-    expected_md5: Option<&[u8; 16]>,
-    depth: u32,
-    limits: ReadLimits,
-) -> Result<()> {
-    if let Some(expected) = expected_md5 {
-        let actual: [u8; 16] = Md5::digest(encoded).into();
-        if &actual != expected {
-            return Err(CascError::ChecksumMismatch("BLTE chunk"));
-        }
-    }
-
+/// for header-less BLTE, expected) decoded size. The chunk's MD5, if it has
+/// one, must already have been checked by [`verify_chunk_md5s`].
+fn decode_chunk_into(encoded: &[u8], out: &mut [u8], depth: u32, limits: ReadLimits) -> Result<()> {
     let Some((&mode, payload)) = encoded.split_first() else {
         return Err(CascError::malformed(
             "BLTE chunk",
@@ -733,6 +720,17 @@ impl<R: ChunkRead> ChunkStream<R> {
                 self.window_start = start;
             }
 
+            // Verify the whole batch before decoding any of it, hashing
+            // several chunks at a time as `verify_chunk_md5s` does.
+            let window = &self.window;
+            let window_start = self.window_start;
+            let encoded = |chunk: &ChunkInfo| {
+                let from = chunk.offset - window_start;
+                &window[from..from + chunk.compressed_size as usize]
+            };
+            if !md5_all_match(chunks[i..j].iter().map(|c| (encoded(c), &c.md5))) {
+                return Err(CascError::ChecksumMismatch("BLTE chunk"));
+            }
             for chunk in &chunks[i..j] {
                 let (dst, tail) = rest
                     .split_at_mut_checked(chunk.decompressed_size as usize)
@@ -740,9 +738,7 @@ impl<R: ChunkRead> ChunkStream<R> {
                         CascError::malformed("BLTE chunk table", "decoded size overflow")
                     })?;
                 rest = tail;
-                let from = chunk.offset - self.window_start;
-                let encoded = &self.window[from..from + chunk.compressed_size as usize];
-                decode_chunk_into(encoded, dst, Some(&chunk.md5), 0, self.limits)?;
+                decode_chunk_into(encoded(chunk), dst, 0, self.limits)?;
             }
             i = j;
         }
@@ -782,6 +778,49 @@ fn validate_chunk_table(data_len: usize, header: &BlteHeader, limits: ReadLimits
         return Err(limit("BLTE decoded chunk", limits.max_chunk_decoded_bytes));
     }
     Ok(declared_total)
+}
+
+/// Checks every chunk's MD5 against its chunk table entry.
+///
+/// Chunks are hashed several at a time (see `md5lanes`, native only), which is
+/// markedly faster than hashing them one after another. Doing this for the
+/// whole table before decoding also means no chunk is inflated from a
+/// buffer that failed verification.
+fn verify_chunk_md5s(data: &[u8], chunks: &[ChunkInfo]) -> Result<()> {
+    let mut bad_span = None;
+    let jobs = chunks
+        .iter()
+        .map_while(|chunk| match chunk_data(data, chunk) {
+            Ok(encoded) => Some((encoded, &chunk.md5)),
+            Err(e) => {
+                bad_span = Some(e);
+                None
+            }
+        });
+    let all_match = md5_all_match(jobs);
+    if let Some(e) = bad_span {
+        return Err(e);
+    }
+    if !all_match {
+        return Err(CascError::ChecksumMismatch("BLTE chunk"));
+    }
+    Ok(())
+}
+
+/// Whether every `(data, expected)` pair's MD5 matches.
+#[cfg(not(target_arch = "wasm32"))]
+fn md5_all_match<'a>(jobs: impl Iterator<Item = (&'a [u8], &'a [u8; 16])>) -> bool {
+    hash_many(jobs, |expected, actual| &actual == expected)
+}
+
+/// Whether every `(data, expected)` pair's MD5 matches.
+///
+/// On wasm32 the multi-lane hasher gains only a few percent (the engine
+/// doesn't exploit the instruction-level parallelism) while adding ~10 KB of
+/// code, so hash serially.
+#[cfg(target_arch = "wasm32")]
+fn md5_all_match<'a>(mut jobs: impl Iterator<Item = (&'a [u8], &'a [u8; 16])>) -> bool {
+    jobs.all(|(data, expected)| &<[u8; 16]>::from(Md5::digest(data)) == expected)
 }
 
 /// One chunk's encoded bytes (mode byte included).
@@ -928,6 +967,31 @@ mod tests {
         blte[last] ^= 0xFF;
         let err = decode(&blte).unwrap_err();
         assert!(matches!(err, CascError::ChecksumMismatch("BLTE chunk")));
+    }
+
+    #[test]
+    fn md5_mismatch_in_any_chunk_of_a_large_table_is_detected() {
+        let payloads: Vec<Vec<u8>> = (0..11u8)
+            .map(|i| vec![i; 40 + usize::from(i) * 37])
+            .collect();
+        let chunks: Vec<(u8, &[u8], u32)> = payloads
+            .iter()
+            .map(|p| (b'N', p.as_slice(), p.len() as u32))
+            .collect();
+        let blte = build_blte(&chunks);
+        let expected: Vec<u8> = payloads.concat();
+        assert_eq!(decode(&blte).unwrap(), expected);
+
+        let header = BlteHeader::parse(&blte).unwrap();
+        for chunk in header.chunks() {
+            let mut bad = blte.clone();
+            // Flip the last byte of this chunk's payload.
+            bad[chunk.offset + chunk.compressed_size as usize - 1] ^= 1;
+            let err = decode(&bad).unwrap_err();
+            assert!(matches!(err, CascError::ChecksumMismatch("BLTE chunk")));
+            let err = decode_into_vec(&bad, expected.len(), ReadLimits::default()).unwrap_err();
+            assert!(matches!(err, CascError::ChecksumMismatch("BLTE chunk")));
+        }
     }
 
     #[test]
