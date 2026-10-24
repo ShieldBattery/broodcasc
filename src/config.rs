@@ -641,7 +641,8 @@ build-playbuild-installer = ngdptool_casc2
 
     /// Printable ASCII excluding `|` (the field separator) and newlines
     /// (already excluded by the printable range). Excludes values starting
-    /// with `#`: if such a value lands in a record's first column, the
+    /// with `#` after leading whitespace (which the parser trims): if such a
+    /// value lands in a record's first column, the
     /// serialized line itself would start with `#` and `BuildInfo::parse`
     /// would (correctly) skip it as a comment line, which would break the
     /// roundtrip below — not a bug in the parser, just untestable input for
@@ -654,7 +655,9 @@ build-playbuild-installer = ngdptool_casc2
             1..12,
         )
         .prop_map(|cs| cs.into_iter().collect::<String>())
-        .prop_filter("not a comment", |v: &String| !v.starts_with('#'))
+        .prop_filter("not a comment", |v: &String| {
+            !v.trim_start().starts_with('#')
+        })
     }
 
     /// At least 2 unique column names, so a serialized record line always
