@@ -110,31 +110,38 @@ impl EncodingTable {
             })?;
         let page_index = &data[espec_end..page_index_end];
 
-        let mut entries = Vec::new();
-        let mut page_start = page_index_end;
-        for page_num in 0..header.ckey_page_count {
-            let index_entry =
-                &page_index[page_num * PAGE_INDEX_ENTRY_SIZE..][..PAGE_INDEX_ENTRY_SIZE];
-            let expected_first_ckey = &index_entry[..KEY_SIZE];
-            let expected_md5 = &index_entry[KEY_SIZE..];
-
-            let page_end = page_start
-                .checked_add(header.ckey_page_size)
-                .ok_or_else(|| {
-                    CascError::malformed("encoding table", "CKey page extends past end of input")
-                })?;
-            let page = data.get(page_start..page_end).ok_or_else(|| {
+        let pages_end = header
+            .ckey_page_count
+            .checked_mul(header.ckey_page_size)
+            .and_then(|size| page_index_end.checked_add(size))
+            .filter(|&end| end <= data.len())
+            .ok_or_else(|| {
                 CascError::malformed("encoding table", "CKey page extends past end of input")
             })?;
+        let pages = &data[page_index_end..pages_end];
 
+        // Pass 1: verify every page's MD5 and count its entries, so the
+        // table is allocated at its exact final size (a growing Vec would
+        // retain up to 2x the needed capacity).
+        let mut total = 0usize;
+        for (page, index_entry) in pages
+            .chunks_exact(header.ckey_page_size)
+            .zip(page_index.chunks_exact(PAGE_INDEX_ENTRY_SIZE))
+        {
             let actual_md5: [u8; 16] = Md5::digest(page).into();
-            if actual_md5 != expected_md5 {
+            if actual_md5 != index_entry[KEY_SIZE..] {
                 return Err(CascError::ChecksumMismatch("encoding page"));
             }
+            total += count_page_entries(page);
+        }
 
-            parse_page(page, expected_first_ckey, &mut entries)?;
-
-            page_start = page_end;
+        // Pass 2: parse.
+        let mut entries = Vec::with_capacity(total);
+        for (page, index_entry) in pages
+            .chunks_exact(header.ckey_page_size)
+            .zip(page_index.chunks_exact(PAGE_INDEX_ENTRY_SIZE))
+        {
+            parse_page(page, &index_entry[..KEY_SIZE], &mut entries)?;
         }
 
         Ok(EncodingTable { entries })
@@ -160,6 +167,24 @@ impl EncodingTable {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+/// Counts a page's entries by walking only the `ekey_count` bytes. Stops
+/// quietly at anything malformed; [`parse_page`] reports the error properly.
+fn count_page_entries(page: &[u8]) -> usize {
+    let mut cursor = 0usize;
+    let mut count = 0usize;
+    while let Some(&ekey_count) = page.get(cursor) {
+        if ekey_count == 0 {
+            break;
+        }
+        cursor += ENTRY_FIXED_SIZE + ekey_count as usize * KEY_SIZE;
+        if cursor > page.len() {
+            break;
+        }
+        count += 1;
+    }
+    count
 }
 
 /// Parses one CKey page's entries, appending them to `entries` and
