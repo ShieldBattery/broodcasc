@@ -56,10 +56,115 @@ pub trait CdnTransport: Send + Sync {
     /// return a different amount of data.
     fn get_range(&self, url: &str, offset: u64, len: u64) -> Result<Vec<u8>>;
 
+    /// Fetches a batch of independent requests, returning one result per
+    /// request in the same order. The storage layer uses this wherever
+    /// requests don't depend on each other (discovery, configs, the ~40
+    /// archive indices at open), so a transport that can overlap requests
+    /// turns N round trips into one. The provided implementation issues
+    /// them with at most [`DEFAULT_CONCURRENCY`] worker threads on native
+    /// targets and sequentially on `wasm32`; WASM transports with a way to
+    /// issue concurrent fetches should override it. Each result must obey
+    /// the contract of the corresponding single-request method, and the
+    /// returned `Vec` must have exactly `requests.len()` elements.
+    fn get_many(&self, requests: &[CdnRequest]) -> Vec<Result<Vec<u8>>> {
+        get_many_default(self, requests)
+    }
+
     /// Best-effort invalidation hook used when bytes fail verification above
     /// the transport layer. Stateless transports can keep the default no-op;
     /// persistent caches should evict the exact whole or range entry.
     fn invalidate(&self, _url: &str, _range: Option<(u64, u64)>) {}
+}
+
+/// One request in a [`CdnTransport::get_many`] batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CdnRequest {
+    /// Equivalent to [`CdnTransport::get`].
+    Whole {
+        /// Resource URL.
+        url: String,
+        /// Maximum bytes to retain.
+        max_bytes: usize,
+    },
+    /// Equivalent to [`CdnTransport::get_range`].
+    Range {
+        /// Resource URL.
+        url: String,
+        /// First byte of the range.
+        offset: u64,
+        /// Exact number of bytes wanted.
+        len: u64,
+    },
+}
+
+/// Worker-thread count used by the provided [`CdnTransport::get_many`] on
+/// native targets.
+pub const DEFAULT_CONCURRENCY: usize = 4;
+
+fn run_request<T: CdnTransport + ?Sized>(transport: &T, request: &CdnRequest) -> Result<Vec<u8>> {
+    match request {
+        CdnRequest::Whole { url, max_bytes } => transport.get(url, *max_bytes),
+        CdnRequest::Range { url, offset, len } => transport.get_range(url, *offset, *len),
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn get_many_default<T: CdnTransport + ?Sized>(
+    transport: &T,
+    requests: &[CdnRequest],
+) -> Vec<Result<Vec<u8>>> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let workers = requests.len().min(DEFAULT_CONCURRENCY);
+    if workers <= 1 {
+        return requests.iter().map(|r| run_request(transport, r)).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let slots: Vec<Mutex<Option<Result<Vec<u8>>>>> =
+        requests.iter().map(|_| Mutex::new(None)).collect();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(request) = requests.get(i) else {
+                            break;
+                        };
+                        let result = run_request(transport, request);
+                        *slots[i].lock().unwrap_or_else(|e| e.into_inner()) = Some(result);
+                    }
+                })
+            })
+            .collect();
+        // Join every worker so a panicking transport surfaces as an error
+        // for the unfinished requests rather than unwinding through `scope`.
+        for handle in handles {
+            let _ = handle.join();
+        }
+    });
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .unwrap_or_else(|| {
+                    Err(CascError::Transport {
+                        url: String::new(),
+                        reason: "transport worker panicked".to_string(),
+                    })
+                })
+        })
+        .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn get_many_default<T: CdnTransport + ?Sized>(
+    transport: &T,
+    requests: &[CdnRequest],
+) -> Vec<Result<Vec<u8>>> {
+    requests.iter().map(|r| run_request(transport, r)).collect()
 }
 
 impl<T: CdnTransport + ?Sized> CdnTransport for &T {
@@ -69,6 +174,10 @@ impl<T: CdnTransport + ?Sized> CdnTransport for &T {
 
     fn get_range(&self, url: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
         (**self).get_range(url, offset, len)
+    }
+
+    fn get_many(&self, requests: &[CdnRequest]) -> Vec<Result<Vec<u8>>> {
+        (**self).get_many(requests)
     }
 
     fn invalidate(&self, url: &str, range: Option<(u64, u64)>) {
@@ -103,68 +212,124 @@ struct CdnFetcher<T: CdnTransport> {
     index: CdnIndex,
 }
 
+/// Which flavor of hash-addressed metadata file to fetch.
+#[derive(Clone, Copy)]
+enum MetaKind {
+    /// `config/<xx>/<yy>/<hash>`
+    Config,
+    /// `data/<xx>/<yy>/<ekey>.index`
+    Index,
+}
+
+fn no_hosts() -> CascError {
+    CascError::Transport {
+        url: String::new(),
+        reason: "no CDN hosts available".to_string(),
+    }
+}
+
 impl<T: CdnTransport> CdnFetcher<T> {
-    /// Fetches a CDN file (`config/` or `data/` addressing), trying each
-    /// host in order on transport failures.
-    fn get_config(
-        &self,
-        key: &ContentKey,
-        max_bytes: usize,
-        what: &'static str,
-    ) -> Result<Vec<u8>> {
-        let mut last_err = None;
-        for host in &self.hosts {
-            let url = cdn_file_url(
-                host,
-                &self.cdn_path,
-                CdnPathKind::Config,
-                &key.to_string(),
-                false,
-            )?;
-            match self.transport.get(&url, max_bytes) {
-                Ok(bytes) => match verify_raw_ckey(&bytes, key, what) {
-                    Ok(()) => return Ok(bytes),
-                    Err(err) => {
-                        self.transport.invalidate(&url, None);
-                        last_err = Some(err);
-                    }
-                },
-                Err(err @ CascError::NotFound(_)) => return Err(err),
-                Err(err) => last_err = Some(err),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| CascError::Transport {
-            url: String::new(),
-            reason: "no CDN hosts available".to_string(),
-        }))
+    fn meta_url(&self, host: &str, kind: MetaKind, hash: &str) -> Result<String> {
+        let (path_kind, index) = match kind {
+            MetaKind::Config => (CdnPathKind::Config, false),
+            MetaKind::Index => (CdnPathKind::Data, true),
+        };
+        cdn_file_url(host, &self.cdn_path, path_kind, hash, index)
     }
 
-    fn get_index(&self, key: &EncodingKey, max_bytes: usize) -> Result<(usize, ArchiveIndex)> {
-        let mut last_err = None;
-        for host in &self.hosts {
-            let url = cdn_file_url(
-                host,
-                &self.cdn_path,
-                CdnPathKind::Data,
-                &key.to_string(),
-                true,
-            )?;
-            match self.transport.get(&url, max_bytes) {
-                Ok(bytes) => match ArchiveIndex::parse(&bytes) {
-                    Ok(parsed) => return Ok((bytes.len(), parsed)),
-                    Err(err) => {
-                        self.transport.invalidate(&url, None);
-                        last_err = Some(err);
-                    }
-                },
-                Err(err @ CascError::NotFound(_)) => return Err(err),
-                Err(err) => last_err = Some(err),
+    /// Validates one fetched metadata body. `Ok(Some)` is a usable result,
+    /// `Ok(None)` means "try the next host" (the failure is left in
+    /// `last_err`, and a body that failed validation is evicted from the
+    /// transport), and `Err` is a definitive 404.
+    fn settle<R>(
+        &self,
+        url: &str,
+        fetched: Result<Vec<u8>>,
+        validate: &impl Fn(Vec<u8>) -> Result<R>,
+        last_err: &mut Option<CascError>,
+    ) -> Result<Option<R>> {
+        match fetched {
+            Ok(bytes) => match validate(bytes) {
+                Ok(r) => Ok(Some(r)),
+                Err(err) => {
+                    self.transport.invalidate(url, None);
+                    *last_err = Some(err);
+                    Ok(None)
+                }
+            },
+            Err(err @ CascError::NotFound(_)) => Err(err),
+            Err(err) => {
+                *last_err = Some(err);
+                Ok(None)
             }
         }
-        Err(last_err.unwrap_or_else(|| CascError::Transport {
-            url: String::new(),
-            reason: "no CDN hosts available".to_string(),
-        }))
+    }
+
+    /// Fetches and validates one metadata file, trying hosts from
+    /// `host_start` in order on transport or validation failures (a 404 is
+    /// authoritative and not retried).
+    fn get_meta<R>(
+        &self,
+        kind: MetaKind,
+        hash: &str,
+        max_bytes: usize,
+        host_start: usize,
+        mut last_err: Option<CascError>,
+        validate: impl Fn(Vec<u8>) -> Result<R>,
+    ) -> Result<R> {
+        for host in self.hosts.iter().skip(host_start) {
+            let url = self.meta_url(host, kind, hash)?;
+            let fetched = self.transport.get(&url, max_bytes);
+            if let Some(r) = self.settle(&url, fetched, &validate, &mut last_err)? {
+                return Ok(r);
+            }
+        }
+        Err(last_err.unwrap_or_else(no_hosts))
+    }
+
+    /// Fetches several metadata files in one [`CdnTransport::get_many`]
+    /// batch against the first host; any item that fails there falls back to
+    /// the remaining hosts individually. `items` are `(hash, max_bytes)`;
+    /// `fallback_max` bounds those individual retries.
+    fn get_meta_many<R>(
+        &self,
+        kind: MetaKind,
+        items: &[(String, usize)],
+        fallback_max: usize,
+        validate: impl Fn(usize, Vec<u8>) -> Result<R>,
+    ) -> Vec<Result<R>> {
+        let Some(first_host) = self.hosts.first() else {
+            return items.iter().map(|_| Err(no_hosts())).collect();
+        };
+        let mut urls = Vec::with_capacity(items.len());
+        let mut requests = Vec::with_capacity(items.len());
+        for (hash, max_bytes) in items {
+            match self.meta_url(first_host, kind, hash) {
+                Ok(url) => {
+                    requests.push(CdnRequest::Whole {
+                        url: url.clone(),
+                        max_bytes: *max_bytes,
+                    });
+                    urls.push(Ok(url));
+                }
+                Err(err) => urls.push(Err(err)),
+            }
+        }
+        let mut fetched = self.transport.get_many(&requests).into_iter();
+        urls.into_iter()
+            .zip(items)
+            .enumerate()
+            .map(|(i, (url, (hash, _)))| {
+                let url = url?;
+                let fetched = fetched.next().unwrap_or_else(|| Err(no_hosts()));
+                let validate = |bytes| validate(i, bytes);
+                let mut last_err = None;
+                match self.settle(&url, fetched, &validate, &mut last_err)? {
+                    Some(r) => Ok(r),
+                    None => self.get_meta(kind, hash, fallback_max, 1, last_err, validate),
+                }
+            })
+            .collect()
     }
 
     fn invalidate_config(&self, key: &ContentKey) {
@@ -372,9 +537,30 @@ fn merge_archive_index(
     Ok(())
 }
 
+/// Largest per-archive index size declared by the CDN config's
+/// `archives-index-size`, when the list is present, well-formed and matches
+/// the archive count. The list is not positionally aligned with `archives`
+/// on real configs, so only its maximum is used, as a tighter bound than the
+/// blanket per-file cap.
+fn declared_index_cap(config: &BuildConfig, archive_count: usize) -> Option<usize> {
+    let sizes = config
+        .get("archives-index-size")?
+        .split_whitespace()
+        .map(|token| token.parse::<usize>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if sizes.len() != archive_count {
+        return None;
+    }
+    sizes.into_iter().max()
+}
+
+/// Fetches and merges every archive `.index`. `declared_cap` is an optional
+/// tighter per-file bound (see [`declared_index_cap`]) which also lets the
+/// whole set go out as a single [`CdnTransport::get_many`] batch.
 fn load_archive_indexes<T: CdnTransport>(
     fetcher: &CdnFetcher<T>,
     archives: &[EncodingKey],
+    declared_cap: Option<usize>,
     max_bytes: usize,
 ) -> Result<CdnIndex> {
     if archives.len() > MAX_CDN_ARCHIVES {
@@ -384,50 +570,28 @@ fn load_archive_indexes<T: CdnTransport>(
         });
     }
 
-    load_archive_indexes_impl(fetcher, archives, max_bytes)
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn load_archive_indexes_impl<T: CdnTransport>(
-    fetcher: &CdnFetcher<T>,
-    archives: &[EncodingKey],
-    max_bytes: usize,
-) -> Result<CdnIndex> {
-    const WORKERS: usize = MAX_CDN_INDEX_BYTES / MAX_CDN_INDEX_FILE_BYTES;
-    // A true per-index limit keeps native and WASM behavior identical while
-    // ensuring a complete native worker batch fits the aggregate policy.
+    // A true per-index limit keeps native and WASM behavior identical.
     let per_index_max = max_bytes.min(MAX_CDN_INDEX_FILE_BYTES);
+    let request_max = declared_cap.map_or(per_index_max, |cap| cap.min(per_index_max));
+    // Bodies of a whole batch are held at once, so size batches to fit the
+    // aggregate policy: with the declared cap that's typically everything.
+    let batch_len = (MAX_CDN_INDEX_BYTES / request_max.max(1)).clamp(1, MAX_CDN_ARCHIVES);
 
     let mut merged = CdnIndex::new();
     let mut total_bytes = 0usize;
     let mut total_entries = 0usize;
     let mut archive = 0usize;
-    for chunk in archives.chunks(WORKERS) {
-        let chunk_results = std::thread::scope(|scope| {
-            let handles = chunk
-                .iter()
-                .map(|hash| scope.spawn(move || fetcher.get_index(hash, per_index_max)))
-                .collect::<Vec<_>>();
-
-            // Join every worker before propagating an error. This prevents a
-            // panicking worker from escaping `scope` through an unjoined
-            // handle, and retaining handle order preserves archive order.
-            handles
-                .into_iter()
-                .map(|handle| match handle.join() {
-                    Ok(result) => result,
-                    Err(_) => Err(CascError::malformed(
-                        "CDN archive index",
-                        "loader worker panicked",
-                    )),
-                })
-                .collect::<Vec<_>>()
+    for chunk in archives.chunks(batch_len) {
+        let items = chunk
+            .iter()
+            .map(|hash| (hash.to_string(), request_max))
+            .collect::<Vec<_>>();
+        let results = fetcher.get_meta_many(MetaKind::Index, &items, per_index_max, |_, bytes| {
+            ArchiveIndex::parse(&bytes).map(|parsed| (bytes.len(), parsed))
         });
-
-        // All workers in the batch have been joined, so propagating the first
-        // archive-ordered error cannot leave an unjoined panic behind. Merge
-        // each result immediately so only one bounded batch is retained.
-        for result in chunk_results {
+        // Merge in archive order so "later archive wins" holds regardless of
+        // the order requests completed in.
+        for result in results {
             let (downloaded_bytes, parsed) = result?;
             merge_archive_index(
                 &mut merged,
@@ -441,30 +605,6 @@ fn load_archive_indexes_impl<T: CdnTransport>(
         }
     }
 
-    Ok(merged)
-}
-
-#[cfg(target_arch = "wasm32")]
-fn load_archive_indexes_impl<T: CdnTransport>(
-    fetcher: &CdnFetcher<T>,
-    archives: &[EncodingKey],
-    max_bytes: usize,
-) -> Result<CdnIndex> {
-    let per_index_max = max_bytes.min(MAX_CDN_INDEX_FILE_BYTES);
-    let mut merged = CdnIndex::new();
-    let mut total_bytes = 0usize;
-    let mut total_entries = 0usize;
-    for (archive, hash) in archives.iter().enumerate() {
-        let (downloaded_bytes, parsed) = fetcher.get_index(hash, per_index_max)?;
-        merge_archive_index(
-            &mut merged,
-            archive,
-            downloaded_bytes,
-            &parsed,
-            &mut total_bytes,
-            &mut total_entries,
-        )?;
-    }
     Ok(merged)
 }
 
@@ -500,9 +640,23 @@ impl<T: CdnTransport> CdnStorage<T> {
     ) -> Result<Self> {
         validate_discovery_identifier(product, "product")?;
         validate_discovery_identifier(region, "region")?;
-        let versions_bytes =
-            transport.get(&versions_url(region, product), options.max_metadata_bytes())?;
-        let versions = Versions::parse(&String::from_utf8_lossy(&versions_bytes))?;
+        // `versions` and `cdns` are independent: one round trip for both.
+        let max = options.max_metadata_bytes();
+        let [versions_bytes, cdns_bytes] = <[_; 2]>::try_from(transport.get_many(&[
+            CdnRequest::Whole {
+                url: versions_url(region, product),
+                max_bytes: max,
+            },
+            CdnRequest::Whole {
+                url: cdns_url(region, product),
+                max_bytes: max,
+            },
+        ]))
+        .map_err(|_| CascError::Transport {
+            url: versions_url(region, product),
+            reason: "transport get_many returned the wrong number of results".to_string(),
+        })?;
+        let versions = Versions::parse(&String::from_utf8_lossy(&versions_bytes?))?;
         let version = versions
             .region(region)
             .ok_or_else(|| CascError::NotFound(format!("region {region} in {product} versions")))?;
@@ -515,6 +669,7 @@ impl<T: CdnTransport> CdnStorage<T> {
             cdn_config,
             version_name,
             transport,
+            cdns_bytes,
             options,
         )
     }
@@ -553,6 +708,7 @@ impl<T: CdnTransport> CdnStorage<T> {
     ) -> Result<Self> {
         validate_discovery_identifier(product, "product")?;
         validate_discovery_identifier(region, "region")?;
+        let cdns_bytes = transport.get(&cdns_url(region, product), options.max_metadata_bytes());
         Self::open_inner(
             product,
             region,
@@ -560,10 +716,12 @@ impl<T: CdnTransport> CdnStorage<T> {
             cdn_config,
             None,
             transport,
+            cdns_bytes,
             options,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn open_inner(
         product: &str,
         region: &str,
@@ -571,10 +729,10 @@ impl<T: CdnTransport> CdnStorage<T> {
         cdn_config_key: ContentKey,
         version_name: Option<String>,
         transport: T,
+        cdns_bytes: Result<Vec<u8>>,
         options: StorageOptions,
     ) -> Result<Self> {
-        let cdns_bytes = transport.get(&cdns_url(region, product), options.max_metadata_bytes())?;
-        let cdns = Cdns::parse(&String::from_utf8_lossy(&cdns_bytes))?;
+        let cdns = Cdns::parse(&String::from_utf8_lossy(&cdns_bytes?))?;
         let cdn = cdns
             .region(region)
             .ok_or_else(|| CascError::NotFound(format!("region {region} in {product} cdns")))?;
@@ -589,11 +747,23 @@ impl<T: CdnTransport> CdnStorage<T> {
             index: CdnIndex::new(),
         };
 
-        let build_config_bytes = fetcher.get_config(
-            &build_config_key,
+        // Both configs are known by hash, so fetch them in one round trip.
+        let config_keys = [
+            (&build_config_key, "build config"),
+            (&cdn_config_key, "CDN config"),
+        ];
+        let items = config_keys.map(|(key, _)| (key.to_string(), options.max_metadata_bytes()));
+        let [build_config_bytes, cdn_config_bytes] = <[_; 2]>::try_from(fetcher.get_meta_many(
+            MetaKind::Config,
+            &items,
             options.max_metadata_bytes(),
-            "build config",
-        )?;
+            |i, bytes| {
+                let (key, what) = config_keys[i];
+                verify_raw_ckey(&bytes, key, what).map(|()| bytes)
+            },
+        ))
+        .map_err(|_| no_hosts())?;
+        let build_config_bytes = build_config_bytes?;
         let build_config = BuildConfig::parse(&String::from_utf8_lossy(&build_config_bytes))
             .inspect_err(|_| {
                 fetcher.invalidate_config(&build_config_key);
@@ -601,8 +771,7 @@ impl<T: CdnTransport> CdnStorage<T> {
 
         // The CDN config shares the build config's key=value format; its
         // `archives` line lists the archive hashes this build's data spans.
-        let cdn_config_bytes =
-            fetcher.get_config(&cdn_config_key, options.max_metadata_bytes(), "CDN config")?;
+        let cdn_config_bytes = cdn_config_bytes?;
         let cdn_config = BuildConfig::parse(&String::from_utf8_lossy(&cdn_config_bytes))
             .inspect_err(|_| {
                 fetcher.invalidate_config(&cdn_config_key);
@@ -630,7 +799,13 @@ impl<T: CdnTransport> CdnStorage<T> {
             })?);
         }
 
-        let index = load_archive_indexes(&fetcher, &archives, options.max_metadata_bytes())?;
+        let declared_cap = declared_index_cap(&cdn_config, archives.len());
+        let index = load_archive_indexes(
+            &fetcher,
+            &archives,
+            declared_cap,
+            options.max_metadata_bytes(),
+        )?;
         fetcher.archives = archives;
         fetcher.index = index;
 
@@ -1004,7 +1179,7 @@ mod tests {
         );
         let archives = vec![EncodingKey::from([8; 16]); 257];
 
-        let err = load_archive_indexes(&fetcher, &archives, 1024).unwrap_err();
+        let err = load_archive_indexes(&fetcher, &archives, None, 1024).unwrap_err();
 
         assert!(matches!(
             err,
@@ -1108,7 +1283,8 @@ mod tests {
         };
 
         let merged =
-            load_archive_indexes(&fetcher, &[first_archive, second_archive], 2 * 1024).unwrap();
+            load_archive_indexes(&fetcher, &[first_archive, second_archive], None, 2 * 1024)
+                .unwrap();
         assert_eq!(
             *fetcher.transport.completion_order.lock().unwrap(),
             vec![second_url, first_url],
@@ -1119,6 +1295,112 @@ mod tests {
         assert_eq!(entry.archive, 1);
         assert_eq!(entry.offset, 20);
         assert_eq!(entry.encoded_size, 200);
+    }
+
+    #[test]
+    fn default_get_many_preserves_request_order_and_errors() {
+        let transport = ScriptTransport::new(HashMap::from([
+            ("a".to_string(), vec![1]),
+            ("b".to_string(), vec![2, 2]),
+            ("c".to_string(), vec![3, 3, 3]),
+        ]));
+        let whole = |url: &str| CdnRequest::Whole {
+            url: url.to_string(),
+            max_bytes: 8,
+        };
+        let results = transport.get_many(&[
+            whole("c"),
+            whole("missing"),
+            whole("a"),
+            CdnRequest::Whole {
+                url: "b".to_string(),
+                max_bytes: 1,
+            },
+            whole("b"),
+        ]);
+        assert_eq!(results.len(), 5);
+        assert_eq!(results[0].as_ref().unwrap(), &[3, 3, 3]);
+        assert!(matches!(results[1], Err(CascError::NotFound(_))));
+        assert_eq!(results[2].as_ref().unwrap(), &[1]);
+        assert!(matches!(results[3], Err(CascError::LimitExceeded { .. })));
+        assert_eq!(results[4].as_ref().unwrap(), &[2, 2]);
+        assert!(transport.get_many(&[]).is_empty());
+    }
+
+    /// Records the size of every `get_many` batch.
+    struct BatchSpy {
+        inner: ScriptTransport,
+        batches: Mutex<Vec<usize>>,
+    }
+
+    impl CdnTransport for BatchSpy {
+        fn get(&self, url: &str, max_bytes: usize) -> Result<Vec<u8>> {
+            self.inner.get(url, max_bytes)
+        }
+
+        fn get_range(&self, url: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+            self.inner.get_range(url, offset, len)
+        }
+
+        fn get_many(&self, requests: &[CdnRequest]) -> Vec<Result<Vec<u8>>> {
+            self.batches.lock().unwrap().push(requests.len());
+            requests.iter().map(|r| run_request(self, r)).collect()
+        }
+    }
+
+    #[test]
+    fn archive_indexes_load_as_one_batch_when_sizes_are_bounded() {
+        let archives: Vec<_> = (1..=5u8).map(|b| EncodingKey::from([b; 16])).collect();
+        let bodies = archives
+            .iter()
+            .map(|archive| {
+                let url = cdn_file_url(
+                    "cdn.example",
+                    "tpr/sc1live",
+                    CdnPathKind::Data,
+                    &archive.to_string(),
+                    true,
+                )
+                .unwrap();
+                (
+                    url,
+                    archive_index_bytes(EncodingKey::from([0xEE; 16]), 1, 0),
+                )
+            })
+            .collect();
+        let spy = BatchSpy {
+            inner: ScriptTransport::new(bodies),
+            batches: Mutex::new(Vec::new()),
+        };
+        let fetcher = CdnFetcher {
+            transport: spy,
+            limits: ReadLimits::default(),
+            hosts: vec!["cdn.example".to_string()],
+            cdn_path: "tpr/sc1live".to_string(),
+            archives: Vec::new(),
+            index: CdnIndex::new(),
+        };
+
+        let merged = load_archive_indexes(&fetcher, &archives, Some(2048), 1 << 20).unwrap();
+
+        assert_eq!(*fetcher.transport.batches.lock().unwrap(), vec![5]);
+        // Same EKey in every archive: the last one wins.
+        assert_eq!(
+            merged
+                .lookup(&EncodingKey::from([0xEE; 16]))
+                .unwrap()
+                .archive,
+            4
+        );
+    }
+
+    #[test]
+    fn declared_index_cap_requires_matching_count() {
+        let config = BuildConfig::parse("archives-index-size = 10 30 20\n").unwrap();
+        assert_eq!(declared_index_cap(&config, 3), Some(30));
+        assert_eq!(declared_index_cap(&config, 2), None);
+        let bad = BuildConfig::parse("archives-index-size = 10 x\n").unwrap();
+        assert_eq!(declared_index_cap(&bad, 2), None);
     }
 
     #[test]
@@ -1265,7 +1547,11 @@ mod tests {
         );
         fetcher.hosts = vec!["first.example".to_string(), "second.example".to_string()];
 
-        assert!(fetcher.get_index(&archive, 1024).unwrap().1.is_empty());
+        let items = [(archive.to_string(), 1024)];
+        let mut results = fetcher.get_meta_many(MetaKind::Index, &items, 1024, |_, bytes| {
+            ArchiveIndex::parse(&bytes).map(|parsed| (bytes.len(), parsed))
+        });
+        assert!(results.remove(0).unwrap().1.is_empty());
         assert!(fetcher.transport.calls().contains(&Call::Invalidate {
             url: first_url,
             range: None,
@@ -1304,7 +1590,11 @@ mod tests {
         );
         fetcher.hosts = vec!["first.example".to_string(), "second.example".to_string()];
 
-        assert_eq!(fetcher.get_config(&key, 1024, "test config").unwrap(), body);
+        let items = [(key.to_string(), 1024)];
+        let mut results = fetcher.get_meta_many(MetaKind::Config, &items, 1024, |_, bytes| {
+            verify_raw_ckey(&bytes, &key, "test config").map(|()| bytes)
+        });
+        assert_eq!(results.remove(0).unwrap(), body);
         assert!(fetcher.transport.calls().contains(&Call::Invalidate {
             url: first_url,
             range: None,

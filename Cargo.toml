@@ -37,5 +37,9 @@ assert_ok = "1.0"
 proptest = "1.12"
 
 [[example]]
+name = "cdn_perf"
+required-features = ["fs", "cdn-http"]
+
+[[example]]
 name = "extract_fuzz_corpus"
 required-features = ["fs"]
