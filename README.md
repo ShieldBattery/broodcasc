@@ -56,6 +56,19 @@ On WASM (or anything without `std::fs`), build with
 `StorageProvider` implementation — e.g. OPFS sync access handles in a
 worker, or in-memory buffers.
 
+Build settings for WASM, measured on a full SC:R install (`wasm32-unknown-unknown`,
+`--no-default-features`, library plus a thin host-I/O shim, ~130 KB stripped):
+
+- Keep `opt-level = 3` (or `2`) with `lto = true`, `codegen-units = 1`, and
+  `strip = true`. `opt-level = "s"`/`"z"` only shave 3-5% off the `.wasm`
+  but cost 25-50% of MD5/inflate throughput and slow `Storage` open time by
+  30-70%.
+- `-C target-feature=+simd128` and bulk-memory make no measurable difference
+  (the hot loops are scalar), so there is no need to require them.
+- Memory: an opened `Storage` holds roughly 20 MiB (root catalog, encoding
+  table, and index), and WASM linear memory never shrinks, so prefer
+  `read_file_into` with a reused buffer for large files.
+
 ## Resource limits
 
 `ReadLimits` bounds encoded input, decoded output, chunks, nesting, and
