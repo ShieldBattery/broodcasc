@@ -9,7 +9,7 @@
 
 use md5::{Digest, Md5};
 
-use crate::blte::{self, ReadLimits};
+use crate::blte::{self, ChunkRead, ChunkStream, ReadLimits};
 use crate::error::{CascError, Result};
 use crate::keys::ContentKey;
 
@@ -33,15 +33,42 @@ pub(crate) fn read_verified(
     read_verified_prefixed(expected, limits, 0, acquire)
 }
 
+/// What an acquisition callback hands back: either a complete encoded object
+/// or a validated chunk stream that fetches (and verifies) chunk data lazily.
+pub(crate) enum Acquired<R> {
+    Whole(Vec<u8>),
+    Streamed(ChunkStream<R>),
+}
+
+/// Placeholder reader type for acquisitions that never stream.
+#[cfg(any(feature = "cdn", test))]
+type NoStream = fn(u64, &mut [u8]) -> Result<()>;
+
 /// Variant for containers such as local CASC spans where a small framing
 /// prefix is acquired together with the BLTE bytes. Keeping the prefix in the
 /// same allocation avoids a second positioned read without shifting the
 /// entire encoded object in memory.
+#[cfg(any(feature = "cdn", test))]
 pub(crate) fn read_verified_prefixed(
     expected: ExpectedObject<'_>,
     limits: ReadLimits,
     prefix_len: usize,
     acquire: impl FnOnce(usize) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    read_verified_streaming::<NoStream>(expected, limits, prefix_len, |max| {
+        acquire(max).map(Acquired::Whole)
+    })
+}
+
+/// Like [`read_verified_prefixed`], but the callback may instead return a
+/// [`ChunkStream`], which is decoded chunk-by-chunk straight into the output
+/// allocation without ever holding the whole encoded object. All of the same
+/// checks apply.
+pub(crate) fn read_verified_streaming<R: ChunkRead>(
+    expected: ExpectedObject<'_>,
+    limits: ReadLimits,
+    prefix_len: usize,
+    acquire: impl FnOnce(usize) -> Result<Acquired<R>>,
 ) -> Result<Vec<u8>> {
     let decoded_size = expected
         .decoded_size
@@ -49,45 +76,73 @@ pub(crate) fn read_verified_prefixed(
         .transpose()?;
 
     let acquired = acquire(limits.max_encoded_bytes)?;
-    let encoded = encoded_suffix(&acquired, prefix_len, limits)?;
-
-    let decoded = match decoded_size {
-        // Expected sizes come from verified metadata (encoding table, build
-        // config), so the output is allocated once at its final size rather
-        // than grown from `initial_reserve_bytes`.
-        Some(size) => {
-            let mut decoded = Vec::new();
-            decoded
-                .try_reserve_exact(size)
-                .map_err(|_| CascError::LimitExceeded {
-                    what: "decoded object allocation",
-                    limit: limits.max_decoded_bytes,
-                })?;
-            decoded.resize(size, 0);
-            blte::decode_into(encoded, &mut decoded, limits)?;
+    // Expected sizes come from verified metadata (encoding table, build
+    // config), so the output is allocated once at its final size rather
+    // than grown from `initial_reserve_bytes`.
+    let decoded = match acquired {
+        Acquired::Whole(acquired) => {
+            let encoded = encoded_suffix(&acquired, prefix_len, limits)?;
+            match decoded_size {
+                Some(size) => {
+                    let mut decoded = alloc_output(size, limits)?;
+                    blte::decode_into(encoded, &mut decoded, limits)?;
+                    decoded
+                }
+                None => blte::decode_with_limits(encoded, limits)?,
+            }
+        }
+        Acquired::Streamed(stream) => {
+            let size = check_decoded_size(stream.decoded_size() as u64, limits)?;
+            if let Some(expected_size) = decoded_size
+                && expected_size != size
+            {
+                return Err(CascError::malformed(
+                    "BLTE chunk table",
+                    format!(
+                        "declared decoded size {size} does not match expected size {expected_size}"
+                    ),
+                ));
+            }
+            let mut decoded = alloc_output(size, limits)?;
+            stream.decode_into(&mut decoded)?;
             decoded
         }
-        None => blte::decode_with_limits(encoded, limits)?,
     };
     verify_ckey(&decoded, expected.ckey)?;
     Ok(decoded)
 }
 
-/// Variant of [`read_verified_prefixed`] that decodes into caller-provided
+/// Variant of [`read_verified_streaming`] that decodes into caller-provided
 /// memory. `out.len()` is the expected decoded size; it is checked against
 /// the limits before anything is acquired.
-pub(crate) fn read_verified_into_prefixed(
+pub(crate) fn read_verified_into_streaming<R: ChunkRead>(
     ckey: Option<&ContentKey>,
     out: &mut [u8],
     limits: ReadLimits,
     prefix_len: usize,
-    acquire: impl FnOnce(usize) -> Result<Vec<u8>>,
+    acquire: impl FnOnce(usize) -> Result<Acquired<R>>,
 ) -> Result<()> {
     check_decoded_size(out.len() as u64, limits)?;
-    let acquired = acquire(limits.max_encoded_bytes)?;
-    let encoded = encoded_suffix(&acquired, prefix_len, limits)?;
-    blte::decode_into(encoded, out, limits)?;
+    match acquire(limits.max_encoded_bytes)? {
+        Acquired::Whole(acquired) => {
+            let encoded = encoded_suffix(&acquired, prefix_len, limits)?;
+            blte::decode_into(encoded, out, limits)?;
+        }
+        Acquired::Streamed(stream) => stream.decode_into(out)?,
+    }
     verify_ckey(out, ckey)
+}
+
+fn alloc_output(size: usize, limits: ReadLimits) -> Result<Vec<u8>> {
+    let mut decoded = Vec::new();
+    decoded
+        .try_reserve_exact(size)
+        .map_err(|_| CascError::LimitExceeded {
+            what: "decoded object allocation",
+            limit: limits.max_decoded_bytes,
+        })?;
+    decoded.resize(size, 0);
+    Ok(decoded)
 }
 
 fn check_decoded_size(size: u64, limits: ReadLimits) -> Result<usize> {
@@ -128,6 +183,18 @@ mod tests {
     use md5::{Digest, Md5};
 
     use super::*;
+
+    fn read_verified_into_prefixed(
+        ckey: Option<&ContentKey>,
+        out: &mut [u8],
+        limits: ReadLimits,
+        prefix_len: usize,
+        acquire: impl FnOnce(usize) -> Result<Vec<u8>>,
+    ) -> Result<()> {
+        read_verified_into_streaming::<NoStream>(ckey, out, limits, prefix_len, |max| {
+            acquire(max).map(Acquired::Whole)
+        })
+    }
 
     fn single_raw(payload: &[u8]) -> Vec<u8> {
         let mut out = b"BLTE\0\0\0\0N".to_vec();

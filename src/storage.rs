@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use md5::{Digest, Md5};
 
-use crate::blte::ReadLimits;
+use crate::blte::{ChunkRead, ChunkStream, ReadLimits, STREAM_PREFIX_BYTES, StreamOpen};
 use crate::config::{BuildConfig, BuildInfo};
 use crate::encoding::EncodingTable;
 use crate::error::{CascError, Result};
@@ -18,7 +18,9 @@ use crate::idx::{IdxEntry, LocalIndex};
 use crate::io::{ReadAt, StorageProvider};
 use crate::jenkins::hashlittle2;
 use crate::keys::{ContentKey, EncodingKey};
-use crate::object::{ExpectedObject, read_verified_into_prefixed, read_verified_prefixed};
+use crate::object::{
+    Acquired, ExpectedObject, read_verified_into_streaming, read_verified_streaming,
+};
 use crate::root::RootFile;
 
 /// Size of the span header preceding every BLTE stream in a `data.###`
@@ -113,14 +115,14 @@ impl<P: StorageProvider> SpanReader<P> {
             .index
             .lookup(ekey)
             .ok_or_else(|| CascError::NotFound(ekey.to_string()))?;
-        read_verified_prefixed(
+        read_verified_streaming(
             ExpectedObject {
                 ckey: expected_ckey,
                 decoded_size,
             },
             self.limits,
             SPAN_HEADER_SIZE as usize,
-            |encoded_limit| self.read_span(ekey, &entry, encoded_limit),
+            |encoded_limit| self.acquire(ekey, &entry, encoded_limit),
         )
     }
 
@@ -136,24 +138,74 @@ impl<P: StorageProvider> SpanReader<P> {
             .index
             .lookup(ekey)
             .ok_or_else(|| CascError::NotFound(ekey.to_string()))?;
-        read_verified_into_prefixed(
+        read_verified_into_streaming(
             expected_ckey,
             out,
             self.limits,
             SPAN_HEADER_SIZE as usize,
-            |encoded_limit| self.read_span(ekey, &entry, encoded_limit),
+            |encoded_limit| self.acquire(ekey, &entry, encoded_limit),
         )
     }
 
-    /// Acquires a complete span (30-byte header plus BLTE stream),
-    /// sanity-checking the header against the index entry. The verification
-    /// boundary decodes only the suffix without copying it.
+    /// Acquires the span for `ekey`: small spans come back whole in a single
+    /// positioned read; larger ones as a [`ChunkStream`] that reads, verifies
+    /// and decodes the BLTE chunks in bounded batches, so the encoded object
+    /// is never held in memory all at once.
+    fn acquire(
+        &self,
+        ekey: &EncodingKey,
+        entry: &IdxEntry,
+        encoded_limit: usize,
+    ) -> Result<Acquired<impl ChunkRead + use<'_, P>>> {
+        let (archive, prefix, span_size) =
+            self.open_span(ekey, entry, encoded_limit, STREAM_PREFIX_BYTES)?;
+        if prefix.len() == span_size {
+            return Ok(Acquired::Whole(prefix));
+        }
+        let blte_base = entry.offset + SPAN_HEADER_SIZE;
+        let reader = Arc::clone(&archive);
+        let opened = ChunkStream::open(
+            &prefix[SPAN_HEADER_SIZE as usize..],
+            span_size - SPAN_HEADER_SIZE as usize,
+            move |offset, buf: &mut [u8]| reader.read_exact_at(blte_base + offset, buf),
+            self.limits,
+        )?;
+        match opened {
+            StreamOpen::Chunked(stream) => Ok(Acquired::Streamed(stream)),
+            // No chunk table: the single chunk needs the whole buffer.
+            StreamOpen::Headerless => {
+                drop(prefix);
+                Ok(Acquired::Whole(
+                    archive.read_vec_at(entry.offset, span_size)?,
+                ))
+            }
+        }
+    }
+
+    /// Acquires a complete span (30-byte header plus BLTE stream) in one
+    /// positioned read.
+    #[cfg(test)]
     fn read_span(
         &self,
         ekey: &EncodingKey,
         entry: &IdxEntry,
         encoded_limit: usize,
     ) -> Result<Vec<u8>> {
+        self.open_span(ekey, entry, encoded_limit, usize::MAX)
+            .map(|(_, span, _)| span)
+    }
+
+    /// Reads the span header plus up to `prefix_cap` bytes of BLTE data in one
+    /// positioned read and sanity-checks the header against the index entry.
+    /// Returns the archive handle, the bytes read (the whole span if it fits),
+    /// and the full span size.
+    fn open_span(
+        &self,
+        ekey: &EncodingKey,
+        entry: &IdxEntry,
+        encoded_limit: usize,
+        prefix_cap: usize,
+    ) -> Result<(Arc<P::File>, Vec<u8>, usize)> {
         if entry.encoded_size as u64 <= SPAN_HEADER_SIZE {
             // Placeholder spans are filtered at idx parse time; seeing one
             // here means the index and archives disagree.
@@ -185,7 +237,8 @@ impl<P: StorageProvider> SpanReader<P> {
         // A single positioned read avoids a header read followed by a second
         // payload read for every object. The shared verification boundary
         // decodes the suffix directly, without shifting this allocation.
-        let span = archive.read_vec_at(entry.offset, span_size)?;
+        let first_read = span_size.min((SPAN_HEADER_SIZE as usize).saturating_add(prefix_cap));
+        let span = archive.read_vec_at(entry.offset, first_read)?;
         let header = span
             .get(..SPAN_HEADER_SIZE as usize)
             .ok_or_else(|| CascError::malformed("span", "truncated span header"))?;
@@ -227,7 +280,7 @@ impl<P: StorageProvider> SpanReader<P> {
                 "local span header Jenkins hash",
             ));
         }
-        Ok(span)
+        Ok((archive, span, span_size))
     }
 
     /// Returns the (lazily-opened, cached) handle for `data.<archive>`.
@@ -681,6 +734,166 @@ mod tests {
             err,
             CascError::ChecksumMismatch("local span header Jenkins hash")
         ));
+    }
+
+    /// Builds a `(ekey, index entry, span bytes)` triple for `payload`.
+    fn make_span(payload: &[u8]) -> (EncodingKey, IdxEntry, Vec<u8>) {
+        let ekey = EncodingKey::from(<[u8; 16]>::from(Md5::digest(payload)));
+        let entry = IdxEntry {
+            archive: 0,
+            offset: 0,
+            encoded_size: (SPAN_HEADER_SIZE as usize + payload.len()) as u32,
+        };
+        let mut span = vec![0u8; SPAN_HEADER_SIZE as usize];
+        for (dst, src) in span[..16].iter_mut().zip(ekey.as_bytes().iter().rev()) {
+            *dst = *src;
+        }
+        span[16..20].copy_from_slice(&entry.encoded_size.to_le_bytes());
+        let jenkins_hash = hashlittle2(&span[..0x16], SPAN_JENKINS_SEED, 0).0;
+        span[0x16..0x1A].copy_from_slice(&jenkins_hash.to_le_bytes());
+        span.extend_from_slice(payload);
+        (ekey, entry, span)
+    }
+
+    /// A chunk-table BLTE of `count` raw chunks of `size` bytes each, plus the
+    /// decoded content.
+    fn chunked_blte(count: usize, size: usize) -> (Vec<u8>, Vec<u8>) {
+        let datas: Vec<Vec<u8>> = (0..count)
+            .map(|i| {
+                let mut d = vec![b'N'];
+                d.extend((0..size).map(|j| (i * 31 + j) as u8));
+                d
+            })
+            .collect();
+        let header_size = 12 + 24 * count;
+        let mut blte = b"BLTE".to_vec();
+        blte.extend_from_slice(&(header_size as u32).to_be_bytes());
+        blte.push(0x0F);
+        blte.extend_from_slice(&(count as u32).to_be_bytes()[1..]);
+        let mut decoded = Vec::new();
+        for d in &datas {
+            blte.extend_from_slice(&(d.len() as u32).to_be_bytes());
+            blte.extend_from_slice(&((d.len() - 1) as u32).to_be_bytes());
+            blte.extend_from_slice(&<[u8; 16]>::from(Md5::digest(d)));
+            decoded.extend_from_slice(&d[1..]);
+        }
+        for d in &datas {
+            blte.extend_from_slice(d);
+        }
+        (blte, decoded)
+    }
+
+    fn reader_with(span: Vec<u8>) -> (SpanReader<MemoryProvider>, Arc<AtomicUsize>) {
+        let (provider, reads) = MemoryProvider::one("Data/data/data.000", span);
+        let reader = SpanReader {
+            provider,
+            index: LocalIndex::default(),
+            limits: ReadLimits::default(),
+            archives: Mutex::new(HashMap::new()),
+        };
+        (reader, reads)
+    }
+
+    fn read_streamed(
+        reader: &SpanReader<MemoryProvider>,
+        ekey: &EncodingKey,
+        entry: &IdxEntry,
+        ckey: Option<&ContentKey>,
+        decoded_size: Option<u64>,
+    ) -> Result<Vec<u8>> {
+        read_verified_streaming(
+            ExpectedObject { ckey, decoded_size },
+            reader.limits,
+            SPAN_HEADER_SIZE as usize,
+            |limit| reader.acquire(ekey, entry, limit),
+        )
+    }
+
+    #[test]
+    fn large_span_streams_in_batches_without_whole_span_read() {
+        let (blte, decoded) = chunked_blte(40, 100 * 1024);
+        let (ekey, entry, span) = make_span(&blte);
+        let ckey = ContentKey::from(<[u8; 16]>::from(Md5::digest(&decoded)));
+        let (reader, reads) = reader_with(span);
+
+        let got = read_streamed(
+            &reader,
+            &ekey,
+            &entry,
+            Some(&ckey),
+            Some(decoded.len() as u64),
+        )
+        .unwrap();
+        assert_eq!(got, decoded);
+        // Prefix read + a handful of ~1 MiB batches, never one read per chunk.
+        let n = reads.load(Ordering::Relaxed);
+        assert!((2..=7).contains(&n), "{n} reads");
+
+        // Same bytes into caller memory, with identical verification.
+        let mut out = vec![0u8; decoded.len()];
+        read_verified_into_streaming(
+            Some(&ckey),
+            &mut out,
+            reader.limits,
+            SPAN_HEADER_SIZE as usize,
+            |limit| reader.acquire(&ekey, &entry, limit),
+        )
+        .unwrap();
+        assert_eq!(out, decoded);
+
+        let wrong = ContentKey::from([0; 16]);
+        let err = read_streamed(&reader, &ekey, &entry, Some(&wrong), None).unwrap_err();
+        assert!(matches!(
+            err,
+            CascError::ChecksumMismatch("decoded content (CKey)")
+        ));
+        let err = read_streamed(&reader, &ekey, &entry, None, Some(decoded.len() as u64 - 1))
+            .unwrap_err();
+        assert!(matches!(err, CascError::Malformed { .. }));
+    }
+
+    #[test]
+    fn streamed_span_enforces_limits_and_integrity() {
+        let (blte, decoded) = chunked_blte(8, 100 * 1024);
+        let (ekey, entry, span) = make_span(&blte);
+
+        // Corrupt data in the last chunk, far from the prefix read.
+        let mut bad = span.clone();
+        let last = bad.len() - 1;
+        bad[last] ^= 1;
+        let (reader, _) = reader_with(bad);
+        let err = read_streamed(&reader, &ekey, &entry, None, None).unwrap_err();
+        assert!(matches!(err, CascError::ChecksumMismatch("BLTE chunk")));
+
+        // Archive shorter than the index claims.
+        let (reader, _) = reader_with(span[..span.len() - 50_000].to_vec());
+        assert!(read_streamed(&reader, &ekey, &entry, None, None).is_err());
+
+        // Decoded-size and encoded-size limits.
+        let (mut reader, reads) = reader_with(span.clone());
+        reader.limits.max_decoded_bytes = decoded.len() - 1;
+        let err = read_streamed(&reader, &ekey, &entry, None, None).unwrap_err();
+        assert!(matches!(err, CascError::LimitExceeded { .. }));
+        reader.limits = ReadLimits {
+            max_encoded_bytes: blte.len() - 1,
+            ..ReadLimits::default()
+        };
+        reads.store(0, Ordering::Relaxed);
+        let err = read_streamed(&reader, &ekey, &entry, None, None).unwrap_err();
+        assert!(matches!(err, CascError::LimitExceeded { .. }));
+        assert_eq!(reads.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn large_headerless_span_falls_back_to_whole_read() {
+        let mut blte = b"BLTE    N".to_vec();
+        let payload: Vec<u8> = (0..150_000u32).map(|i| i as u8).collect();
+        blte.extend_from_slice(&payload);
+        let (ekey, entry, span) = make_span(&blte);
+        let (reader, reads) = reader_with(span);
+        let got = read_streamed(&reader, &ekey, &entry, None, Some(payload.len() as u64)).unwrap();
+        assert_eq!(got, payload);
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
     }
 
     #[test]

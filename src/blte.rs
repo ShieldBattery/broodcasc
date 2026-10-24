@@ -401,7 +401,7 @@ fn decode_inner(
         return decode_chunk_inner(encoded, None, None, depth, limits, output_limit);
     }
 
-    let declared_total = validate_chunk_table(data, &header, limits)?;
+    let declared_total = validate_chunk_table(data.len(), &header, limits)?;
     if declared_total > output_limit {
         return Err(limit("BLTE decoded output", output_limit));
     }
@@ -452,7 +452,7 @@ fn decode_into_inner(data: &[u8], out: &mut [u8], depth: u32, limits: ReadLimits
         return decode_chunk_into(encoded, out, None, depth, limits);
     }
 
-    let declared_total = validate_chunk_table(data, &header, limits)?;
+    let declared_total = validate_chunk_table(data.len(), &header, limits)?;
     if declared_total != out.len() {
         return Err(CascError::malformed(
             "BLTE chunk table",
@@ -571,6 +571,181 @@ fn decode_chunk_into(
     }
 }
 
+/// How many encoded bytes a caller should fetch up front for
+/// [`ChunkStream::open`]: enough for the header of any realistic object, and
+/// for small objects the whole thing.
+pub(crate) const STREAM_PREFIX_BYTES: usize = 64 * 1024;
+/// Upper bound on the encoded bytes fetched per positioned read while
+/// streaming; adjacent chunks are batched up to this size. A single chunk
+/// larger than this is read on its own.
+const STREAM_BATCH_BYTES: usize = 1024 * 1024;
+
+/// Positioned reader over a BLTE stream: `read(offset, buf)` fills `buf` with
+/// the stream bytes starting at `offset`.
+pub(crate) trait ChunkRead: FnMut(u64, &mut [u8]) -> Result<()> {}
+impl<F: FnMut(u64, &mut [u8]) -> Result<()>> ChunkRead for F {}
+
+/// Result of [`ChunkStream::open`].
+pub(crate) enum StreamOpen<R> {
+    /// The object has a chunk table and can be decoded chunk-by-chunk.
+    Chunked(ChunkStream<R>),
+    /// `header_size == 0`: a single chunk of unknown size that has to be
+    /// decoded from a complete buffer.
+    Headerless,
+}
+
+/// A BLTE object whose chunk table has been read and validated but whose
+/// chunk data is still in the backing store. Chunks are fetched in batches
+/// through `read_at`, verified and decoded straight into the output, so peak
+/// memory is the output plus one batch rather than the whole encoded object.
+///
+/// `read_at(offset, buf)` must fill `buf` with the BLTE bytes starting at
+/// `offset` (relative to the start of the BLTE stream).
+pub(crate) struct ChunkStream<R> {
+    header: BlteHeader,
+    declared_total: usize,
+    window: Vec<u8>,
+    window_start: usize,
+    read_at: R,
+    limits: ReadLimits,
+}
+
+impl<R: ChunkRead> ChunkStream<R> {
+    /// Parses and validates the BLTE header of a `blte_len`-byte stream whose
+    /// first bytes are `prefix` (at least the 8-byte preamble unless the
+    /// stream is shorter). Fetches the rest of the chunk table through
+    /// `read_at` when it extends past `prefix`.
+    pub(crate) fn open(
+        prefix: &[u8],
+        blte_len: usize,
+        mut read_at: R,
+        limits: ReadLimits,
+    ) -> Result<StreamOpen<R>> {
+        if blte_len > limits.max_encoded_bytes {
+            return Err(limit("BLTE encoded input", limits.max_encoded_bytes));
+        }
+        let prefix = &prefix[..prefix.len().min(blte_len)];
+        let mut window = Vec::new();
+        window
+            .try_reserve_exact(prefix.len())
+            .map_err(|_| limit("BLTE read buffer allocation", limits.max_encoded_bytes))?;
+        window.extend_from_slice(prefix);
+
+        // The preamble must be in hand to size the header.
+        if window.len() < 8 && blte_len > window.len() {
+            let have = window.len();
+            let want = blte_len.min(8);
+            window.resize(want, 0);
+            read_at(have as u64, &mut window[have..])?;
+        }
+        // A header longer than the prefix needs its tail fetched before it can
+        // be parsed. The chunk count is checked first so the fetch is bounded
+        // by `max_chunk_count`; anything else implausible is rejected by the
+        // parser from the bytes already in hand.
+        if window.len() >= 8 && window.starts_with(MAGIC) {
+            let header_size = u32::from_be_bytes(window[4..8].try_into().unwrap()) as usize;
+            if header_size > window.len() && header_size <= blte_len {
+                if let Some(count) = window.get(9..12)
+                    && u32::from_be_bytes([0, count[0], count[1], count[2]]) as usize
+                        > limits.max_chunk_count
+                {
+                    return Err(limit("BLTE chunk count", limits.max_chunk_count));
+                }
+                if header_size > 12 + CHUNK_ENTRY_SIZE * limits.max_chunk_count {
+                    return Err(CascError::malformed(
+                        "BLTE header",
+                        "header_size does not match chunk_count",
+                    ));
+                }
+                let have = window.len();
+                window.resize(header_size, 0);
+                read_at(have as u64, &mut window[have..])?;
+            }
+        }
+
+        let header = parse_with_limits(&window, limits)?;
+        if header.chunks.is_empty() {
+            return Ok(StreamOpen::Headerless);
+        }
+        let declared_total = validate_chunk_table(blte_len, &header, limits)?;
+        Ok(StreamOpen::Chunked(ChunkStream {
+            header,
+            declared_total,
+            window,
+            window_start: 0,
+            read_at,
+            limits,
+        }))
+    }
+
+    /// Total decoded size declared by the chunk table.
+    pub(crate) fn decoded_size(&self) -> usize {
+        self.declared_total
+    }
+
+    /// Fetches, verifies, and decodes every chunk into `out`, whose length
+    /// must equal [`Self::decoded_size`]. Checks match [`decode_into`]; `out`
+    /// may be partially written on failure.
+    pub(crate) fn decode_into(mut self, out: &mut [u8]) -> Result<()> {
+        if out.len() != self.declared_total {
+            return Err(CascError::malformed(
+                "BLTE chunk table",
+                format!(
+                    "declared decoded size {} does not match expected size {}",
+                    self.declared_total,
+                    out.len()
+                ),
+            ));
+        }
+        let chunks = &self.header.chunks;
+        let mut rest = out;
+        let mut i = 0;
+        while i < chunks.len() {
+            // Batch adjacent chunks into one read, always taking at least one.
+            let start = chunks[i].offset;
+            let mut end = start + chunks[i].compressed_size as usize;
+            let mut j = i + 1;
+            while let Some(next) = chunks.get(j) {
+                let next_end = next.offset + next.compressed_size as usize;
+                if next_end - start > STREAM_BATCH_BYTES {
+                    break;
+                }
+                end = next_end;
+                j += 1;
+            }
+
+            let window_end = self.window_start + self.window.len();
+            if start < self.window_start || end > window_end {
+                let need = end - start;
+                if need > self.window.len() {
+                    self.window
+                        .try_reserve(need - self.window.len())
+                        .map_err(|_| {
+                            limit("BLTE read buffer allocation", self.limits.max_encoded_bytes)
+                        })?;
+                }
+                self.window.resize(need, 0);
+                (self.read_at)(start as u64, &mut self.window)?;
+                self.window_start = start;
+            }
+
+            for chunk in &chunks[i..j] {
+                let (dst, tail) = rest
+                    .split_at_mut_checked(chunk.decompressed_size as usize)
+                    .ok_or_else(|| {
+                        CascError::malformed("BLTE chunk table", "decoded size overflow")
+                    })?;
+                rest = tail;
+                let from = chunk.offset - self.window_start;
+                let encoded = &self.window[from..from + chunk.compressed_size as usize];
+                decode_chunk_into(encoded, dst, Some(&chunk.md5), 0, self.limits)?;
+            }
+            i = j;
+        }
+        Ok(())
+    }
+}
+
 /// The single implicit chunk of a header-less (`header_size == 0`) buffer.
 fn implicit_chunk<'a>(data: &'a [u8], header: &BlteHeader) -> Result<&'a [u8]> {
     data.get(header.data_start..)
@@ -579,7 +754,7 @@ fn implicit_chunk<'a>(data: &'a [u8], header: &BlteHeader) -> Result<&'a [u8]> {
 
 /// Checks a parsed chunk table against the input and limits before any chunk
 /// is decoded, returning the declared total decoded size.
-fn validate_chunk_table(data: &[u8], header: &BlteHeader, limits: ReadLimits) -> Result<usize> {
+fn validate_chunk_table(data_len: usize, header: &BlteHeader, limits: ReadLimits) -> Result<usize> {
     let declared_total = header.chunks.iter().try_fold(0usize, |sum, chunk| {
         sum.checked_add(chunk.decompressed_size as usize)
             .ok_or_else(|| CascError::malformed("BLTE header", "decoded size overflow"))
@@ -589,13 +764,10 @@ fn validate_chunk_table(data: &[u8], header: &BlteHeader, limits: ReadLimits) ->
         .last()
         .and_then(|chunk| chunk.offset.checked_add(chunk.compressed_size as usize))
         .ok_or_else(|| CascError::malformed("BLTE header", "chunk size overflow"))?;
-    if encoded_end != data.len() {
+    if encoded_end != data_len {
         return Err(CascError::malformed(
             "BLTE chunk data",
-            format!(
-                "declared chunks end at byte {encoded_end}, but input length is {}",
-                data.len()
-            ),
+            format!("declared chunks end at byte {encoded_end}, but input length is {data_len}"),
         ));
     }
     if header
@@ -1137,6 +1309,219 @@ mod tests {
                     ..
                 }
             ));
+        }
+    }
+
+    /// Streams `blte` through [`ChunkStream`] with a counting in-memory
+    /// reader, returning the decode result and the number of reads issued.
+    fn stream_decode(
+        blte: &[u8],
+        prefix_len: usize,
+        out_len: Option<usize>,
+        limits: ReadLimits,
+    ) -> (Result<Vec<u8>>, usize) {
+        let reads = std::cell::Cell::new(0usize);
+        let source = blte.to_vec();
+        let prefix = &blte[..prefix_len.min(blte.len())];
+        let opened = ChunkStream::open(
+            prefix,
+            blte.len(),
+            |offset, buf: &mut [u8]| {
+                reads.set(reads.get() + 1);
+                let start = usize::try_from(offset).unwrap();
+                let src = source.get(start..start + buf.len()).ok_or_else(|| {
+                    CascError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof))
+                })?;
+                buf.copy_from_slice(src);
+                Ok(())
+            },
+            limits,
+        );
+        let result = match opened {
+            Err(e) => Err(e),
+            Ok(StreamOpen::Headerless) => decode_with_limits(blte, limits),
+            Ok(StreamOpen::Chunked(stream)) => {
+                let mut out = vec![0; out_len.unwrap_or(stream.decoded_size())];
+                stream.decode_into(&mut out).map(|()| out)
+            }
+        };
+        (result, reads.get())
+    }
+
+    #[test]
+    fn stream_matches_decode_for_every_prefix_length() {
+        let raws = vec![
+            (true, b"compressible compressible compressible".to_vec()),
+            (false, b"raw".to_vec()),
+            (true, vec![7u8; 5000]),
+            (false, b"tail".to_vec()),
+        ];
+        let blte = build_valid_blte(&raws);
+        let expected = decode(&blte).unwrap();
+        for prefix_len in 0..=blte.len() {
+            let (decoded, _) = stream_decode(&blte, prefix_len, None, ReadLimits::default());
+            assert_eq!(decoded.unwrap(), expected, "prefix {prefix_len}");
+        }
+    }
+
+    #[test]
+    fn stream_nested_chunks_decode() {
+        let inner = build_valid_blte(&[(true, b"inner inner inner".to_vec())]);
+        let blte = build_blte(&[(b'F', &inner, 17), (b'N', b"!", 1)]);
+        let (decoded, _) = stream_decode(&blte, 8, None, ReadLimits::default());
+        assert_eq!(decoded.unwrap(), b"inner inner inner!");
+    }
+
+    #[test]
+    fn stream_whole_object_in_prefix_needs_no_reads() {
+        let blte = build_valid_blte(&[(false, b"abc".to_vec()), (true, vec![1; 100])]);
+        let (decoded, reads) = stream_decode(&blte, blte.len(), None, ReadLimits::default());
+        assert_eq!(decoded.unwrap().len(), 103);
+        assert_eq!(reads, 0);
+    }
+
+    #[test]
+    fn stream_batches_adjacent_chunks_into_few_reads() {
+        // 40 incompressible-ish 100 KiB raw chunks = ~4 MiB encoded.
+        let raws: Vec<(bool, Vec<u8>)> = (0..40u8).map(|i| (false, vec![i; 100 * 1024])).collect();
+        let blte = build_valid_blte(&raws);
+        let (decoded, reads) = stream_decode(&blte, 4096, None, ReadLimits::default());
+        let decoded = decoded.unwrap();
+        assert_eq!(decoded.len(), 40 * 100 * 1024);
+        assert_eq!(decoded, decode(&blte).unwrap());
+        // Header tail (1) plus ceil(4 MiB / 1 MiB batches of 10 chunks).
+        assert!(reads <= 6, "{reads} reads");
+        assert!(reads > 1);
+    }
+
+    #[test]
+    fn stream_single_chunk_larger_than_a_batch_is_read_whole() {
+        let raw = vec![9u8; 3 * STREAM_BATCH_BYTES];
+        let blte = build_valid_blte(&[(false, raw.clone())]);
+        let (decoded, reads) = stream_decode(&blte, 4096, None, ReadLimits::default());
+        assert_eq!(decoded.unwrap(), raw);
+        assert_eq!(reads, 1);
+    }
+
+    #[test]
+    fn stream_detects_corrupt_late_chunk() {
+        let raws: Vec<(bool, Vec<u8>)> = (0..8u8).map(|i| (false, vec![i; 300 * 1024])).collect();
+        let mut blte = build_valid_blte(&raws);
+        let last = blte.len() - 1;
+        blte[last] ^= 1;
+        let (decoded, _) = stream_decode(&blte, 4096, None, ReadLimits::default());
+        assert!(matches!(
+            decoded.unwrap_err(),
+            CascError::ChecksumMismatch("BLTE chunk")
+        ));
+    }
+
+    #[test]
+    fn stream_reports_source_truncation_as_error() {
+        let raws: Vec<(bool, Vec<u8>)> = (0..8u8).map(|i| (false, vec![i; 300 * 1024])).collect();
+        let blte = build_valid_blte(&raws);
+        // Declared length is honored, but the backing store ends early.
+        let reads = std::cell::Cell::new(0);
+        let short = &blte[..blte.len() / 2];
+        let opened = ChunkStream::open(
+            &blte[..4096],
+            blte.len(),
+            |offset, buf: &mut [u8]| {
+                reads.set(reads.get() + 1);
+                let start = usize::try_from(offset).unwrap();
+                let src = short
+                    .get(start..start + buf.len())
+                    .ok_or_else(|| CascError::malformed("test", "eof"))?;
+                buf.copy_from_slice(src);
+                Ok(())
+            },
+            ReadLimits::default(),
+        );
+        let Ok(StreamOpen::Chunked(stream)) = opened else {
+            panic!("expected chunked stream");
+        };
+        let mut out = vec![0; stream.decoded_size()];
+        assert!(stream.decode_into(&mut out).is_err());
+    }
+
+    #[test]
+    fn stream_headerless_is_reported_not_decoded() {
+        let blte = build_single_chunk(b'N', b"hello");
+        let opened = ChunkStream::open(
+            &blte,
+            blte.len(),
+            |_: u64, _: &mut [u8]| panic!("no reads expected"),
+            ReadLimits::default(),
+        );
+        assert!(matches!(opened, Ok(StreamOpen::Headerless)));
+    }
+
+    #[test]
+    fn stream_rejects_wrong_output_length() {
+        let blte = build_valid_blte(&[(false, b"abcd".to_vec())]);
+        let (decoded, _) = stream_decode(&blte, blte.len(), Some(3), ReadLimits::default());
+        assert!(matches!(
+            decoded.unwrap_err(),
+            CascError::Malformed {
+                what: "BLTE chunk table",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn stream_enforces_limits_before_reading_chunk_data() {
+        let raws: Vec<(bool, Vec<u8>)> = (0..4u8).map(|i| (false, vec![i; 1000])).collect();
+        let blte = build_valid_blte(&raws);
+
+        let limits = ReadLimits {
+            max_encoded_bytes: blte.len() - 1,
+            ..ReadLimits::default()
+        };
+        let (r, reads) = stream_decode(&blte, 64, None, limits);
+        assert!(matches!(r.unwrap_err(), CascError::LimitExceeded { .. }));
+        assert_eq!(reads, 0);
+
+        let limits = ReadLimits {
+            max_chunk_count: 3,
+            ..ReadLimits::default()
+        };
+        let (r, reads) = stream_decode(&blte, 64, None, limits);
+        assert!(matches!(r.unwrap_err(), CascError::LimitExceeded { .. }));
+        assert_eq!(reads, 0);
+
+        let limits = ReadLimits {
+            max_chunk_decoded_bytes: 999,
+            ..ReadLimits::default()
+        };
+        let (r, reads) = stream_decode(&blte, 4096, None, limits);
+        assert!(matches!(r.unwrap_err(), CascError::LimitExceeded { .. }));
+        assert_eq!(reads, 0);
+    }
+
+    #[test]
+    fn stream_agrees_with_decode_on_corrupted_inputs() {
+        let blte = build_valid_blte(&[
+            (true, b"alpha alpha alpha alpha".to_vec()),
+            (false, b"beta".to_vec()),
+        ]);
+        for i in 0..blte.len() {
+            for flip in [0x01u8, 0x80, 0xFF] {
+                let mut bad = blte.clone();
+                bad[i] ^= flip;
+                let expected = decode(&bad);
+                for prefix in [0, 8, 20, 40, bad.len()] {
+                    let (got, _) = stream_decode(&bad, prefix, None, ReadLimits::default());
+                    assert_eq!(got.is_ok(), expected.is_ok(), "byte {i} flip {flip:#x}");
+                    if let (Ok(got), Ok(expected)) = (got, &expected) {
+                        assert_eq!(&got, expected);
+                    }
+                }
+            }
+        }
+        for len in 0..blte.len() {
+            let (got, _) = stream_decode(&blte[..len], 16, None, ReadLimits::default());
+            assert!(got.is_err(), "truncated to {len}");
         }
     }
 
