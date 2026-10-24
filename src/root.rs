@@ -14,9 +14,6 @@
 //! through the encoding table to actually read the file. See
 //! `docs/casc-format.md` §6.
 
-use std::collections::HashMap;
-use std::collections::hash_map::Entry;
-
 use crate::error::{CascError, Result};
 use crate::keys::ContentKey;
 
@@ -37,8 +34,57 @@ pub struct RootEntry {
 #[derive(Debug, Clone)]
 pub struct RootFile {
     entries: Vec<RootEntry>,
-    /// Normalized (lowercased, `/`-separated) path → index into `entries`.
-    index: HashMap<String, u32>,
+    /// Open-addressing hash table over normalized paths; see [`Slots`].
+    slots: Slots,
+}
+
+/// Open-addressing (linear probing) table mapping a normalized-path hash to
+/// an entry id. The normalized path itself is never stored: candidates are
+/// confirmed by comparing against the entry's original path with
+/// case/separator folding on the fly, so hash collisions can't produce false
+/// matches.
+///
+/// Each slot packs `hash_hi32 << 32 | (id + 1)`; `0` is an empty slot.
+#[derive(Debug, Clone)]
+struct Slots {
+    table: Vec<u64>,
+    mask: usize,
+}
+
+impl Slots {
+    fn with_capacity(entries: usize) -> Slots {
+        // Load factor <= 0.5.
+        let size = entries.saturating_mul(2).max(8).next_power_of_two();
+        Slots {
+            table: vec![0; size],
+            mask: size - 1,
+        }
+    }
+
+    /// Finds the id whose path matches `path` (a raw, un-normalized path),
+    /// or the empty slot where it would be inserted.
+    fn probe<'a>(&self, path: &str, paths: impl Fn(u32) -> &'a str) -> (usize, Option<u32>) {
+        let hash = hash_path(path);
+        let tag = hash & !0xFFFF_FFFF;
+        let mut pos = (hash as usize) & self.mask;
+        loop {
+            let slot = self.table[pos];
+            if slot == 0 {
+                return (pos, None);
+            }
+            if slot & !0xFFFF_FFFF == tag {
+                let id = (slot as u32) - 1;
+                if paths_eq(path, paths(id)) {
+                    return (pos, Some(id));
+                }
+            }
+            pos = (pos + 1) & self.mask;
+        }
+    }
+
+    fn fill(&mut self, pos: usize, path: &str, id: u32) {
+        self.table[pos] = (hash_path(path) & !0xFFFF_FFFF) | (u64::from(id) + 1);
+    }
 }
 
 impl RootFile {
@@ -53,8 +99,10 @@ impl RootFile {
         let text = str::from_utf8(data)
             .map_err(|_| CascError::malformed("root file", "not valid UTF-8"))?;
 
-        let mut entries = Vec::new();
-        let mut index = HashMap::new();
+        // Upper bound on record count, so nothing regrows or rehashes.
+        let max_records = data.iter().filter(|&&b| b == b'\n').count() + 1;
+        let mut entries: Vec<RootEntry> = Vec::with_capacity(max_records);
+        let mut slots = Slots::with_capacity(max_records);
         for line in text.lines() {
             let Some((path, rest)) = line.split_once('|') else {
                 continue;
@@ -67,18 +115,17 @@ impl RootFile {
             };
 
             let id = u32::try_from(entries.len())
-                .map_err(|_| CascError::malformed("root file", "too many entries"))?;
-            match index.entry(normalize_path(path)) {
-                Entry::Vacant(slot) => {
-                    slot.insert(id);
-                }
-                Entry::Occupied(_) => {
-                    return Err(CascError::malformed(
-                        "root file",
-                        format!("duplicate normalized path: {path:?}"),
-                    ));
-                }
+                .ok()
+                .filter(|&id| id != u32::MAX)
+                .ok_or_else(|| CascError::malformed("root file", "too many entries"))?;
+            let (pos, existing) = slots.probe(path, |i| entries[i as usize].path.as_str());
+            if existing.is_some() {
+                return Err(CascError::malformed(
+                    "root file",
+                    format!("duplicate normalized path: {path:?}"),
+                ));
             }
+            slots.fill(pos, path, id);
             entries.push(RootEntry {
                 path: path.to_string(),
                 ckey,
@@ -91,15 +138,18 @@ impl RootFile {
                 "no valid records; input is probably not a root file",
             ));
         }
+        entries.shrink_to_fit();
 
-        Ok(RootFile { entries, index })
+        Ok(RootFile { entries, slots })
     }
 
     /// Looks up a file by path, case-insensitively; `\` and `/` separators
     /// are interchangeable.
     pub fn lookup(&self, path: &str) -> Option<&RootEntry> {
-        let id = *self.index.get(&normalize_path(path))?;
-        Some(&self.entries[id as usize])
+        let (_, id) = self
+            .slots
+            .probe(path, |i| self.entries[i as usize].path.as_str());
+        Some(&self.entries[id? as usize])
     }
 
     /// All records, in file order.
@@ -116,15 +166,46 @@ impl RootFile {
     }
 }
 
-fn normalize_path(path: &str) -> String {
-    let mut out = String::with_capacity(path.len());
-    for c in path.chars() {
-        match c {
-            '\\' => out.push('/'),
-            _ => out.push(c.to_ascii_lowercase()),
-        }
+/// Folds one path byte: ASCII-lowercase, `\` → `/`. Non-ASCII UTF-8 bytes
+/// pass through, which matches per-char `to_ascii_lowercase`.
+#[inline]
+fn fold(b: u8) -> u8 {
+    if b == b'\\' {
+        b'/'
+    } else {
+        b.to_ascii_lowercase()
     }
-    out
+}
+
+/// Case/separator-insensitive hash of a path (FxHash-style byte mixing).
+#[inline]
+fn hash_path(path: &str) -> u64 {
+    const K: u64 = 0x517c_c1b7_2722_0a95;
+    let mut h: u64 = 0;
+    for &b in path.as_bytes() {
+        h = (h.rotate_left(5) ^ u64::from(fold(b))).wrapping_mul(K);
+    }
+    // Spread entropy into the low bits used for the table index and the
+    // high bits used for the tag.
+    h ^ (h >> 29)
+}
+
+#[inline]
+fn paths_eq(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).all(|(x, y)| fold(x) == fold(y))
+}
+
+#[cfg(test)]
+fn normalize_path(path: &str) -> String {
+    path.chars()
+        .map(|c| {
+            if c == '\\' {
+                '/'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
