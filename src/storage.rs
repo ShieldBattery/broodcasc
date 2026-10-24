@@ -387,6 +387,7 @@ impl<P: StorageProvider> Storage<P> {
         let encoding_bytes =
             spans.read_by_ekey(&encoding_ekey, Some(&encoding_ckey), encoding_size)?;
         let encoding = EncodingTable::parse(&encoding_bytes)?;
+        drop(encoding_bytes);
 
         let root_ckey = build_config.root()?;
         let root_enc = encoding
@@ -395,6 +396,7 @@ impl<P: StorageProvider> Storage<P> {
         let root_bytes =
             spans.read_by_ekey(&root_enc.ekey, Some(&root_ckey), Some(root_enc.size))?;
         let root = RootFile::parse(&root_bytes)?;
+        drop(root_bytes);
 
         // Bootstrap metadata is deliberately tighter than ordinary content.
         // Restore the caller's content policy for subsequent file reads.
