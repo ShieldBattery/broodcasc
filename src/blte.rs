@@ -651,7 +651,11 @@ impl<R: ChunkRead> ChunkStream<R> {
                 {
                     return Err(limit("BLTE chunk count", limits.max_chunk_count));
                 }
-                if header_size > 12 + CHUNK_ENTRY_SIZE * limits.max_chunk_count {
+                if header_size
+                    > CHUNK_ENTRY_SIZE
+                        .saturating_mul(limits.max_chunk_count)
+                        .saturating_add(12)
+                {
                     return Err(CascError::malformed(
                         "BLTE header",
                         "header_size does not match chunk_count",
