@@ -195,5 +195,22 @@ fn main() {
         l1.1 - l0.1,
         l1.2 - l0.2
     );
+    let before = logical.snap();
+    let r0 = logical.rounds.load(Relaxed);
+    let paths: Vec<&str> = names
+        .iter()
+        .step_by(step)
+        .take(sample)
+        .map(String::as_str)
+        .collect();
+    let t = Instant::now();
+    let out = storage.read_files(&paths);
+    let n_ok = out.iter().filter(|r| r.is_ok()).count();
+    println!(
+        "batch.files={n_ok} batch.ms={:.1} batch.rounds={} batch.ranges={}",
+        t.elapsed().as_secs_f64() * 1e3,
+        logical.rounds.load(Relaxed) - r0,
+        logical.snap().1 - before.1
+    );
     show("total.network", &net);
 }

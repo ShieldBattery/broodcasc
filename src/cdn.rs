@@ -193,6 +193,23 @@ struct AcquiredEncoded {
     next_host: usize,
 }
 
+/// Where an EKey's bytes live on the CDN (host-independent).
+struct Located {
+    /// The data file to request: the archive when `range` is set, else the
+    /// loose file named by the EKey.
+    key: EncodingKey,
+    range: Option<(u64, u64)>,
+    index_key: Option<EncodingKey>,
+}
+
+/// One object of a batched read.
+#[derive(Clone, Copy)]
+struct ReadItem<'a> {
+    ekey: EncodingKey,
+    ckey: Option<&'a ContentKey>,
+    decoded_size: Option<u64>,
+}
+
 /// The EKey-addressed lower half of a CDN storage: hosts, archive list, and
 /// merged archive index. Separate from [`CdnStorage`] so the bootstrap can
 /// fetch the encoding table before the CKey layer exists (same shape as the
@@ -369,7 +386,19 @@ impl<T: CdnTransport> CdnFetcher<T> {
         expected_ckey: Option<&ContentKey>,
         decoded_size: Option<u64>,
     ) -> Result<Vec<u8>> {
-        let mut host_start = 0usize;
+        self.read_by_ekey_from(ekey, expected_ckey, decoded_size, 0, None)
+    }
+
+    /// [`Self::read_by_ekey`] starting at host `host_start`, optionally
+    /// seeded with an already-acquired first attempt (from a batch fetch).
+    fn read_by_ekey_from(
+        &self,
+        ekey: &EncodingKey,
+        expected_ckey: Option<&ContentKey>,
+        decoded_size: Option<u64>,
+        mut host_start: usize,
+        mut prefetched: Option<AcquiredEncoded>,
+    ) -> Result<Vec<u8>> {
         loop {
             let mut acquired_source = None;
             let result = read_verified(
@@ -379,7 +408,10 @@ impl<T: CdnTransport> CdnFetcher<T> {
                 },
                 self.limits,
                 |encoded_limit| {
-                    let acquired = self.acquire_encoded(ekey, encoded_limit, host_start)?;
+                    let acquired = match prefetched.take() {
+                        Some(acquired) => acquired,
+                        None => self.acquire_encoded(ekey, encoded_limit, host_start)?,
+                    };
                     acquired_source = Some((
                         acquired.url,
                         acquired.range,
@@ -408,12 +440,88 @@ impl<T: CdnTransport> CdnFetcher<T> {
         }
     }
 
-    fn acquire_encoded(
-        &self,
-        ekey: &EncodingKey,
-        encoded_limit: usize,
-        host_start: usize,
-    ) -> Result<AcquiredEncoded> {
+    /// Reads several objects with one [`CdnTransport::get_many`] batch
+    /// against the first host; per-object failures fall back to the
+    /// remaining hosts exactly like [`Self::read_by_ekey`]. All encoded
+    /// bodies of the batch are in memory at once.
+    fn read_many(&self, items: &[ReadItem<'_>]) -> Vec<Result<Vec<u8>>> {
+        let limit = self.limits.max_encoded_bytes;
+        let plans: Vec<Result<(Located, String)>> = items
+            .iter()
+            .map(|item| {
+                let located = self.locate(&item.ekey, limit)?;
+                let host = self.hosts.first().ok_or_else(no_hosts)?;
+                let url = cdn_file_url(
+                    host,
+                    &self.cdn_path,
+                    CdnPathKind::Data,
+                    &located.key.to_string(),
+                    false,
+                )?;
+                Ok((located, url))
+            })
+            .collect();
+        let requests: Vec<CdnRequest> = plans
+            .iter()
+            .flatten()
+            .map(|(located, url)| match located.range {
+                Some((offset, len)) => CdnRequest::Range {
+                    url: url.clone(),
+                    offset,
+                    len,
+                },
+                None => CdnRequest::Whole {
+                    url: url.clone(),
+                    max_bytes: limit,
+                },
+            })
+            .collect();
+        let mut fetched = if requests.is_empty() {
+            Vec::new()
+        } else {
+            self.transport.get_many(&requests)
+        }
+        .into_iter();
+
+        plans
+            .into_iter()
+            .zip(items)
+            .map(|(plan, item)| {
+                let (located, url) = plan?;
+                let read_from = |host_start, prefetched| {
+                    self.read_by_ekey_from(
+                        &item.ekey,
+                        item.ckey,
+                        item.decoded_size,
+                        host_start,
+                        prefetched,
+                    )
+                };
+                match fetched.next().unwrap_or_else(|| Err(no_hosts())) {
+                    Ok(bytes) => read_from(
+                        0,
+                        Some(AcquiredEncoded {
+                            bytes,
+                            url,
+                            range: located.range,
+                            index_key: located.index_key,
+                            next_host: 1,
+                        }),
+                    ),
+                    Err(CascError::NotFound(_)) if located.range.is_none() => {
+                        Err(CascError::NotFound(item.ekey.to_string()))
+                    }
+                    Err(err @ CascError::NotFound(_)) => Err(err),
+                    Err(err) if self.hosts.len() <= 1 => Err(err),
+                    Err(_) => read_from(1, None),
+                }
+            })
+            .collect()
+    }
+
+    /// Resolves where `ekey`'s bytes live: a range within an archive when
+    /// indexed, otherwise the loose file named by the EKey itself.
+    fn locate(&self, ekey: &EncodingKey, encoded_limit: usize) -> Result<Located> {
         match self.index.lookup(ekey) {
             Some(entry) => {
                 let archive = self.archives.get(entry.archive as usize).ok_or_else(|| {
@@ -430,21 +538,38 @@ impl<T: CdnTransport> CdnFetcher<T> {
                         limit: encoded_limit,
                     });
                 }
-                let offset = u64::from(entry.offset);
-                let len = u64::from(entry.encoded_size);
-                self.acquire_from_hosts(
-                    archive,
-                    encoded_limit,
-                    Some((offset, len)),
-                    Some(*archive),
-                    host_start,
-                )
+                Ok(Located {
+                    key: *archive,
+                    range: Some((u64::from(entry.offset), u64::from(entry.encoded_size))),
+                    index_key: Some(*archive),
+                })
             }
-            None => match self.acquire_from_hosts(ekey, encoded_limit, None, None, host_start) {
-                Ok(acquired) => Ok(acquired),
-                Err(CascError::NotFound(_)) => Err(CascError::NotFound(ekey.to_string())),
-                Err(err) => Err(err),
-            },
+            None => Ok(Located {
+                key: *ekey,
+                range: None,
+                index_key: None,
+            }),
+        }
+    }
+
+    fn acquire_encoded(
+        &self,
+        ekey: &EncodingKey,
+        encoded_limit: usize,
+        host_start: usize,
+    ) -> Result<AcquiredEncoded> {
+        let located = self.locate(ekey, encoded_limit)?;
+        match self.acquire_from_hosts(
+            &located.key,
+            encoded_limit,
+            located.range,
+            located.index_key,
+            host_start,
+        ) {
+            Err(CascError::NotFound(_)) if located.range.is_none() => {
+                Err(CascError::NotFound(ekey.to_string()))
+            }
+            other => other,
         }
     }
 
@@ -846,6 +971,54 @@ impl<T: CdnTransport> CdnStorage<T> {
             CascError::NotFound(_) => CascError::NotFound(path.to_string()),
             other => other,
         })
+    }
+
+    /// Downloads several files by root-catalog path, issuing their requests
+    /// as one [`CdnTransport::get_many`] batch so a transport that can
+    /// overlap requests pays one round trip instead of one per file. Results
+    /// are in `paths` order; each is exactly what [`CdnStorage::read_file`]
+    /// would return for that path. The encoded bodies of the whole batch are
+    /// held in memory together, so callers reading very large sets should
+    /// chunk their requests.
+    pub fn read_files(&self, paths: &[&str]) -> Vec<Result<Vec<u8>>> {
+        let resolved: Vec<Result<ReadItem<'_>>> = paths
+            .iter()
+            .map(|path| {
+                let entry = self
+                    .root
+                    .lookup(path)
+                    .ok_or_else(|| CascError::NotFound((*path).to_string()))?;
+                let enc = self
+                    .encoding
+                    .lookup(&entry.ckey)
+                    .ok_or_else(|| CascError::NotFound((*path).to_string()))?;
+                Ok(ReadItem {
+                    ekey: enc.ekey,
+                    ckey: Some(&enc.ckey),
+                    decoded_size: Some(enc.size),
+                })
+            })
+            .collect();
+        let items: Vec<ReadItem<'_>> = resolved
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .copied()
+            .collect();
+        let mut results = self.fetcher.read_many(&items).into_iter();
+        resolved
+            .into_iter()
+            .zip(paths)
+            .map(|(r, path)| {
+                r?;
+                results
+                    .next()
+                    .unwrap_or_else(|| Err(no_hosts()))
+                    .map_err(|e| match e {
+                        CascError::NotFound(_) => CascError::NotFound((*path).to_string()),
+                        other => other,
+                    })
+            })
+            .collect()
     }
 
     /// The decoded size of a file, without downloading it.
@@ -1392,6 +1565,65 @@ mod tests {
                 .archive,
             4
         );
+    }
+
+    #[test]
+    fn read_many_batches_requests_and_falls_back_per_item() {
+        let url = |host: &str, ekey: &EncodingKey| {
+            cdn_file_url(
+                host,
+                "tpr/sc1live",
+                CdnPathKind::Data,
+                &ekey.to_string(),
+                false,
+            )
+            .unwrap()
+        };
+        let keys: Vec<_> = (1..=3u8).map(|b| EncodingKey::from([b; 16])).collect();
+        let (good, flaky, missing) = (b"good".as_slice(), b"flaky".as_slice(), keys[2]);
+        let bodies = HashMap::from([
+            (url("a.example", &keys[0]), single_raw(good)),
+            (url("b.example", &keys[0]), single_raw(good)),
+            (url("a.example", &keys[1]), b"corrupt".to_vec()),
+            (url("b.example", &keys[1]), single_raw(flaky)),
+        ]);
+        let spy = BatchSpy {
+            inner: ScriptTransport::new(bodies),
+            batches: Mutex::new(Vec::new()),
+        };
+        let fetcher = CdnFetcher {
+            transport: spy,
+            limits: ReadLimits::default(),
+            hosts: vec!["a.example".to_string(), "b.example".to_string()],
+            cdn_path: "tpr/sc1live".to_string(),
+            archives: Vec::new(),
+            index: CdnIndex::new(),
+        };
+        let (good_key, flaky_key) = (content_key(good), content_key(flaky));
+        let items = [
+            ReadItem {
+                ekey: keys[0],
+                ckey: Some(&good_key),
+                decoded_size: None,
+            },
+            ReadItem {
+                ekey: keys[1],
+                ckey: Some(&flaky_key),
+                decoded_size: None,
+            },
+            ReadItem {
+                ekey: missing,
+                ckey: None,
+                decoded_size: None,
+            },
+        ];
+
+        let results = fetcher.read_many(&items);
+
+        assert_eq!(*fetcher.transport.batches.lock().unwrap(), vec![3]);
+        assert_eq!(results[0].as_ref().unwrap(), good);
+        assert_eq!(results[1].as_ref().unwrap(), flaky);
+        assert!(matches!(&results[2], Err(CascError::NotFound(k)) if *k == missing.to_string()));
     }
 
     #[test]
