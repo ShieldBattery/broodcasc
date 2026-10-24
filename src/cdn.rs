@@ -315,11 +315,26 @@ impl<T: CdnTransport> CdnFetcher<T> {
         fallback_max: usize,
         validate: impl Fn(usize, Vec<u8>) -> Result<R>,
     ) -> Vec<Result<R>> {
+        self.get_meta_many_with(kind, items, fallback_max, validate, None)
+            .0
+    }
+
+    /// [`Self::get_meta_many`] that additionally rides one unrelated
+    /// `extra` request along in the same batch (same round trip), returning
+    /// its raw result.
+    fn get_meta_many_with<R>(
+        &self,
+        kind: MetaKind,
+        items: &[(String, usize)],
+        fallback_max: usize,
+        validate: impl Fn(usize, Vec<u8>) -> Result<R>,
+        extra: Option<CdnRequest>,
+    ) -> (Vec<Result<R>>, Option<Result<Vec<u8>>>) {
         let Some(first_host) = self.hosts.first() else {
-            return items.iter().map(|_| Err(no_hosts())).collect();
+            return (items.iter().map(|_| Err(no_hosts())).collect(), None);
         };
         let mut urls = Vec::with_capacity(items.len());
-        let mut requests = Vec::with_capacity(items.len());
+        let mut requests = Vec::with_capacity(items.len() + 1);
         for (hash, max_bytes) in items {
             match self.meta_url(first_host, kind, hash) {
                 Ok(url) => {
@@ -332,8 +347,11 @@ impl<T: CdnTransport> CdnFetcher<T> {
                 Err(err) => urls.push(Err(err)),
             }
         }
+        let has_extra = extra.is_some();
+        requests.extend(extra);
         let mut fetched = self.transport.get_many(&requests).into_iter();
-        urls.into_iter()
+        let results = urls
+            .into_iter()
             .zip(items)
             .enumerate()
             .map(|(i, (url, (hash, _)))| {
@@ -346,7 +364,9 @@ impl<T: CdnTransport> CdnFetcher<T> {
                     None => self.get_meta(kind, hash, fallback_max, 1, last_err, validate),
                 }
             })
-            .collect()
+            .collect();
+        let extra_result = has_extra.then(|| fetched.next().unwrap_or_else(|| Err(no_hosts())));
+        (results, extra_result)
     }
 
     fn invalidate_config(&self, key: &ContentKey) {
@@ -682,12 +702,15 @@ fn declared_index_cap(config: &BuildConfig, archive_count: usize) -> Option<usiz
 /// Fetches and merges every archive `.index`. `declared_cap` is an optional
 /// tighter per-file bound (see [`declared_index_cap`]) which also lets the
 /// whole set go out as a single [`CdnTransport::get_many`] batch.
+/// `speculative` rides along in the first batch (no extra round trip) and
+/// its raw result is returned (`None` if there was nothing to batch it with).
 fn load_archive_indexes<T: CdnTransport>(
     fetcher: &CdnFetcher<T>,
     archives: &[EncodingKey],
     declared_cap: Option<usize>,
     max_bytes: usize,
-) -> Result<CdnIndex> {
+    mut speculative: Option<CdnRequest>,
+) -> Result<(CdnIndex, Option<Result<Vec<u8>>>)> {
     if archives.len() > MAX_CDN_ARCHIVES {
         return Err(CascError::LimitExceeded {
             what: "CDN archive count",
@@ -706,14 +729,20 @@ fn load_archive_indexes<T: CdnTransport>(
     let mut total_bytes = 0usize;
     let mut total_entries = 0usize;
     let mut archive = 0usize;
+    let mut speculative_result = None;
     for chunk in archives.chunks(batch_len) {
         let items = chunk
             .iter()
             .map(|hash| (hash.to_string(), request_max))
             .collect::<Vec<_>>();
-        let results = fetcher.get_meta_many(MetaKind::Index, &items, per_index_max, |_, bytes| {
-            ArchiveIndex::parse(&bytes).map(|parsed| (bytes.len(), parsed))
-        });
+        let (results, extra) = fetcher.get_meta_many_with(
+            MetaKind::Index,
+            &items,
+            per_index_max,
+            |_, bytes| ArchiveIndex::parse(&bytes).map(|parsed| (bytes.len(), parsed)),
+            speculative.take(),
+        );
+        speculative_result = speculative_result.or(extra);
         // Merge in archive order so "later archive wins" holds regardless of
         // the order requests completed in.
         for result in results {
@@ -730,7 +759,7 @@ fn load_archive_indexes<T: CdnTransport>(
         }
     }
 
-    Ok(merged)
+    Ok((merged, speculative_result))
 }
 
 /// An opened CDN storage, ready to read files. The read API mirrors
@@ -924,22 +953,61 @@ impl<T: CdnTransport> CdnStorage<T> {
             })?);
         }
 
-        let declared_cap = declared_index_cap(&cdn_config, archives.len());
-        let index = load_archive_indexes(
-            &fetcher,
-            &archives,
-            declared_cap,
-            options.max_metadata_bytes(),
-        )?;
-        fetcher.archives = archives;
-        fetcher.index = index;
-
         // The encoding table's EKey comes straight from the build config —
         // the one fetch that can't go through encoding itself.
         let (encoding_ckey, encoding_ekey) = build_config.encoding()?;
         let encoding_size = build_config.encoding_size().map(|(decoded, _)| decoded);
-        let encoding_bytes =
-            fetcher.read_by_ekey(&encoding_ekey, Some(&encoding_ckey), encoding_size)?;
+
+        // The encoding table is normally a loose file, and it is by far the
+        // biggest download of the open, so request it in the same batch as
+        // the archive indices. If the indices turn out to cover it (it's
+        // archived), the speculative response is discarded: the cost is one
+        // cheap 404.
+        let speculative = match fetcher.hosts.first() {
+            Some(host) => Some(CdnRequest::Whole {
+                url: cdn_file_url(
+                    host,
+                    &fetcher.cdn_path,
+                    CdnPathKind::Data,
+                    &encoding_ekey.to_string(),
+                    false,
+                )?,
+                max_bytes: fetcher.limits.max_encoded_bytes,
+            }),
+            None => None,
+        };
+        let declared_cap = declared_index_cap(&cdn_config, archives.len());
+        let (index, speculative_result) = load_archive_indexes(
+            &fetcher,
+            &archives,
+            declared_cap,
+            options.max_metadata_bytes(),
+            speculative.clone(),
+        )?;
+        fetcher.archives = archives;
+        fetcher.index = index;
+
+        let prefetched = match (speculative, speculative_result) {
+            (Some(CdnRequest::Whole { url, .. }), Some(Ok(bytes)))
+                if fetcher.index.lookup(&encoding_ekey).is_none() =>
+            {
+                Some(AcquiredEncoded {
+                    bytes,
+                    url,
+                    range: None,
+                    index_key: None,
+                    next_host: 1,
+                })
+            }
+            _ => None,
+        };
+        let encoding_bytes = fetcher.read_by_ekey_from(
+            &encoding_ekey,
+            Some(&encoding_ckey),
+            encoding_size,
+            0,
+            prefetched,
+        )?;
         let encoding = EncodingTable::parse(&encoding_bytes)?;
 
         let root_ckey = build_config.root()?;
@@ -1352,7 +1420,7 @@ mod tests {
         );
         let archives = vec![EncodingKey::from([8; 16]); 257];
 
-        let err = load_archive_indexes(&fetcher, &archives, None, 1024).unwrap_err();
+        let err = load_archive_indexes(&fetcher, &archives, None, 1024, None).unwrap_err();
 
         assert!(matches!(
             err,
@@ -1455,16 +1523,21 @@ mod tests {
             index: CdnIndex::new(),
         };
 
-        let merged =
-            load_archive_indexes(&fetcher, &[first_archive, second_archive], None, 2 * 1024)
-                .unwrap();
+        let merged = load_archive_indexes(
+            &fetcher,
+            &[first_archive, second_archive],
+            None,
+            2 * 1024,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             *fetcher.transport.completion_order.lock().unwrap(),
             vec![second_url, first_url],
             "the transport should complete out of archive order"
         );
 
-        let entry = merged.lookup(&shared_ekey).unwrap();
+        let entry = merged.0.lookup(&shared_ekey).unwrap();
         assert_eq!(entry.archive, 1);
         assert_eq!(entry.offset, 20);
         assert_eq!(entry.encoded_size, 200);
@@ -1541,6 +1614,8 @@ mod tests {
                 )
             })
             .collect();
+        let mut bodies: HashMap<_, _> = bodies;
+        bodies.insert("loose".to_string(), b"speculative".to_vec());
         let spy = BatchSpy {
             inner: ScriptTransport::new(bodies),
             batches: Mutex::new(Vec::new()),
@@ -1554,9 +1629,16 @@ mod tests {
             index: CdnIndex::new(),
         };
 
-        let merged = load_archive_indexes(&fetcher, &archives, Some(2048), 1 << 20).unwrap();
+        let extra = CdnRequest::Whole {
+            url: "loose".to_string(),
+            max_bytes: 16,
+        };
+        let (merged, extra_result) =
+            load_archive_indexes(&fetcher, &archives, Some(2048), 1 << 20, Some(extra)).unwrap();
 
-        assert_eq!(*fetcher.transport.batches.lock().unwrap(), vec![5]);
+        // Indices and the speculative request share one batch.
+        assert_eq!(*fetcher.transport.batches.lock().unwrap(), vec![6]);
+        assert_eq!(extra_result.unwrap().unwrap(), b"speculative");
         // Same EKey in every archive: the last one wins.
         assert_eq!(
             merged
