@@ -77,7 +77,6 @@ fn reads_a_large_multi_chunk_file() {
     let entry = storage
         .root()
         .entries()
-        .iter()
         .find(|e| {
             storage.is_installed(&e.path) && storage.file_size(&e.path).is_ok_and(|s| s > 1_000_000)
         })
@@ -97,7 +96,6 @@ fn read_file_into_matches_read_file() {
     let installed = storage
         .root()
         .entries()
-        .iter()
         .filter(|e| storage.is_installed(&e.path));
     let large = installed
         .clone()
@@ -131,7 +129,6 @@ fn lookup_is_case_and_separator_insensitive() {
     let entry = storage
         .root()
         .entries()
-        .iter()
         .find(|e| e.path.contains('/') && e.path.chars().any(|c| c.is_ascii_uppercase()))
         .expect("some mixed-case path should exist");
     let upper = entry.path.to_ascii_uppercase().replace('/', "\\");
@@ -157,7 +154,6 @@ fn missing_and_uninstalled_paths_error_distinctly() {
     if let Some(entry) = storage
         .root()
         .entries()
-        .iter()
         .find(|e| !storage.is_installed(&e.path))
     {
         match storage.read_file(&entry.path) {

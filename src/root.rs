@@ -17,11 +17,11 @@
 use crate::error::{CascError, Result};
 use crate::keys::ContentKey;
 
-/// One record from the root file.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RootEntry {
+/// One record from the root file, borrowing its path from the [`RootFile`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RootEntry<'a> {
     /// The file's path as stored: `/`-separated, original casing.
-    pub path: String,
+    pub path: &'a str,
     /// MD5 of the file's decoded contents.
     pub ckey: ContentKey,
 }
@@ -33,7 +33,11 @@ pub struct RootEntry {
 /// callers frequently hold Windows-style paths.
 #[derive(Debug, Clone)]
 pub struct RootFile {
-    entries: Vec<RootEntry>,
+    /// All paths, concatenated in file order.
+    arena: String,
+    /// `offsets[i]..offsets[i + 1]` is entry `i`'s span in `arena`.
+    offsets: Vec<u32>,
+    ckeys: Vec<ContentKey>,
     /// Open-addressing hash table over normalized paths; see [`Slots`].
     slots: Slots,
 }
@@ -101,7 +105,11 @@ impl RootFile {
 
         // Upper bound on record count, so nothing regrows or rehashes.
         let max_records = data.iter().filter(|&&b| b == b'\n').count() + 1;
-        let mut entries: Vec<RootEntry> = Vec::with_capacity(max_records);
+        // Paths are a subset of the input, so its length bounds the arena.
+        let mut arena = String::with_capacity(data.len());
+        let mut offsets: Vec<u32> = Vec::with_capacity(max_records + 1);
+        offsets.push(0);
+        let mut ckeys: Vec<ContentKey> = Vec::with_capacity(max_records);
         let mut slots = Slots::with_capacity(max_records);
         for line in text.lines() {
             let Some((path, rest)) = line.split_once('|') else {
@@ -114,11 +122,13 @@ impl RootFile {
                 continue;
             };
 
-            let id = u32::try_from(entries.len())
+            let id = u32::try_from(ckeys.len())
                 .ok()
                 .filter(|&id| id != u32::MAX)
                 .ok_or_else(|| CascError::malformed("root file", "too many entries"))?;
-            let (pos, existing) = slots.probe(path, |i| entries[i as usize].path.as_str());
+            let end = u32::try_from(arena.len() + path.len())
+                .map_err(|_| CascError::malformed("root file", "paths too large"))?;
+            let (pos, existing) = slots.probe(path, |i| span(&arena, &offsets, i));
             if existing.is_some() {
                 return Err(CascError::malformed(
                     "root file",
@@ -126,43 +136,67 @@ impl RootFile {
                 ));
             }
             slots.fill(pos, path, id);
-            entries.push(RootEntry {
-                path: path.to_string(),
-                ckey,
-            });
+            arena.push_str(path);
+            offsets.push(end);
+            ckeys.push(ckey);
         }
 
-        if entries.is_empty() {
+        if ckeys.is_empty() {
             return Err(CascError::malformed(
                 "root file",
                 "no valid records; input is probably not a root file",
             ));
         }
-        entries.shrink_to_fit();
+        arena.shrink_to_fit();
+        offsets.shrink_to_fit();
+        ckeys.shrink_to_fit();
 
-        Ok(RootFile { entries, slots })
+        Ok(RootFile {
+            arena,
+            offsets,
+            ckeys,
+            slots,
+        })
     }
 
     /// Looks up a file by path, case-insensitively; `\` and `/` separators
     /// are interchangeable.
-    pub fn lookup(&self, path: &str) -> Option<&RootEntry> {
+    pub fn lookup(&self, path: &str) -> Option<RootEntry<'_>> {
         let (_, id) = self
             .slots
-            .probe(path, |i| self.entries[i as usize].path.as_str());
-        Some(&self.entries[id? as usize])
+            .probe(path, |i| span(&self.arena, &self.offsets, i));
+        let id = id?;
+        Some(RootEntry {
+            path: span(&self.arena, &self.offsets, id),
+            ckey: *self.ckeys.get(id as usize)?,
+        })
     }
 
     /// All records, in file order.
-    pub fn entries(&self) -> &[RootEntry] {
-        &self.entries
+    pub fn entries(&self) -> impl ExactSizeIterator<Item = RootEntry<'_>> + Clone {
+        self.ckeys.iter().enumerate().map(|(i, &ckey)| RootEntry {
+            path: span(&self.arena, &self.offsets, i as u32),
+            ckey,
+        })
     }
 
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.ckeys.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.ckeys.is_empty()
+    }
+}
+
+/// Entry `id`'s path. Offsets are built from whole-`&str` pushes, so the span
+/// is always a valid slice; the fallback only guards against logic errors.
+#[inline]
+fn span<'a>(arena: &'a str, offsets: &[u32], id: u32) -> &'a str {
+    let i = id as usize;
+    match (offsets.get(i), offsets.get(i + 1)) {
+        (Some(&a), Some(&b)) => arena.get(a as usize..b as usize).unwrap_or(""),
+        _ => "",
     }
 }
 
@@ -223,11 +257,11 @@ mod tests {
         let root = assert_ok!(RootFile::parse(SAMPLE.as_bytes()));
         assert_eq!(root.len(), 3);
         assert_eq!(
-            root.entries()[0].path,
+            root.entries().nth(0).unwrap().path,
             "locales/enUS/Assets/campaign/EXPZerg/Zerg08/staredit/wav/zovtra01.ogg"
         );
         assert_eq!(
-            root.entries()[2].ckey.to_string(),
+            root.entries().nth(2).unwrap().ckey.to_string(),
             "d41d8cd98f00b204e9800998ecf8427e"
         );
     }
@@ -254,7 +288,7 @@ mod tests {
             good/file.wav|316b0274bf2dabaa8db60c3ff1270c85\n";
         let root = assert_ok!(RootFile::parse(text.as_bytes()));
         assert_eq!(root.len(), 1);
-        assert_eq!(root.entries()[0].path, "good/file.wav");
+        assert_eq!(root.entries().nth(0).unwrap().path, "good/file.wav");
     }
 
     #[test]

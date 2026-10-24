@@ -693,7 +693,7 @@ impl<T: CdnTransport> CdnStorage<T> {
 
     /// All file paths in the root catalog, in catalog order.
     pub fn file_names(&self) -> impl Iterator<Item = &str> {
-        self.root.entries().iter().map(|e| e.path.as_str())
+        self.root.entries().map(|e| e.path)
     }
 
     /// Downloads and decodes content by CKey, verifying the result's MD5.

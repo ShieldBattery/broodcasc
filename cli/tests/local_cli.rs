@@ -30,11 +30,10 @@ fn small_installed_paths(dir: &str, n: usize) -> Vec<String> {
     let mut candidates: Vec<(u64, String)> = storage
         .root()
         .entries()
-        .iter()
-        .filter(|e| storage.is_installed(&e.path))
+        .filter(|e| storage.is_installed(e.path))
         .filter_map(|e| {
-            let size = storage.file_size(&e.path).ok()?;
-            (size > 0).then_some((size, e.path.clone()))
+            let size = storage.file_size(e.path).ok()?;
+            (size > 0).then_some((size, e.path.to_string()))
         })
         .collect();
     candidates.sort_by_key(|(size, _)| *size);
