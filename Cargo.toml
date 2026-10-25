@@ -48,3 +48,7 @@ required-features = ["fs", "cdn-http"]
 [[example]]
 name = "extract_fuzz_corpus"
 required-features = ["fs"]
+
+[[example]]
+name = "perf"
+required-features = ["fs"]

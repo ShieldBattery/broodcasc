@@ -178,6 +178,16 @@ fuzz check` (or `cargo +nightly check` from inside `fuzz/`) at least verifies
 the targets compile, and WSL/Linux is the reliable place to actually run
 fuzzing sessions.
 
+## Benchmarks
+
+`cargo run --release --example perf` measures `Storage` open time, heap
+(peak, retained, allocation count), lookup latency, and read throughput
+against a real install (same path rules as the integration tests).
+`cargo run --release --example cdn_perf --features cdn-http -- --cache DIR`
+does the same for `CdnStorage` against the live CDN, also counting requests
+and round trips; the cache dir keeps repeat runs off Blizzard's servers.
+Both print `key=value` lines for diffing before/after runs.
+
 ## Format documentation
 
 See [docs/casc-format.md](docs/casc-format.md) for the on-disk format
