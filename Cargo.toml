@@ -25,9 +25,9 @@ fs = []
 cdn = []
 # Batteries-included native HTTP transport for `cdn`, using ureq.
 cdn-http = ["cdn", "dep:ureq"]
-# Inflate BLTE `Z` chunks with zlib-rs (~30% faster decode natively, more
-# code) instead of the smaller miniz_oxide. Pure Rust either way; leave it off
-# for size-sensitive wasm builds.
+# Inflate BLTE `Z` chunks with zlib-rs instead of the smaller miniz_oxide:
+# ~30% faster decode natively, ~12% on wasm for ~33 KB more code. Pure Rust
+# either way.
 fast-inflate = ["dep:zlib-rs"]
 
 [dependencies]

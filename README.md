@@ -54,7 +54,9 @@ from `NotFound`.
 On WASM (or anything without `std::fs`), build with
 `--no-default-features` and hand `Storage::open_with_provider` your own
 `StorageProvider` implementation — e.g. OPFS sync access handles in a
-worker, or in-memory buffers.
+worker, or in-memory buffers. Add `features = ["fast-inflate"]` back unless
+every byte counts: zlib-rs costs ~33 KB of `.wasm` over miniz_oxide for ~12%
+faster decoding there (~30% natively).
 
 Build settings for WASM, measured on a full SC:R install (`wasm32-unknown-unknown`,
 `--no-default-features`, library plus a thin host-I/O shim, ~130 KB stripped):
@@ -65,9 +67,11 @@ Build settings for WASM, measured on a full SC:R install (`wasm32-unknown-unknow
   30-70%.
 - `-C target-feature=+simd128` and bulk-memory make no measurable difference
   (the hot loops are scalar), so there is no need to require them.
-- Memory: an opened `Storage` holds roughly 20 MiB (root catalog, encoding
-  table, and index), and WASM linear memory never shrinks, so prefer
-  `read_file_into` with a reused buffer for large files.
+- Memory: an opened `Storage` holds roughly 8 MB (root catalog, encoding
+  table, and index) after peaking around 13 MB during open, and WASM linear
+  memory never shrinks. Large files are decoded chunk-by-chunk, so prefer
+  `read_file_into` with a reused buffer for them: it needs only ~1-2 MB
+  beyond the caller's buffer.
 
 ## Resource limits
 
